@@ -3,18 +3,21 @@ import datetime
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import time
 
 from oppo_sign import sign_headers
+from storage import private_root, read_private_json, write_private_json
+from runtime import curl_executable
 
-AUTH_FILE = Path(os.environ.get('OPPO_HEALTH_AUTH_FILE', str(Path.home() / '.local/share/astrbot-oppo-health/auth.json'))).expanduser()
+AUTH_FILE = Path(os.environ.get('OPPO_HEALTH_AUTH_FILE', str(private_root() / 'auth.json'))).expanduser()
 HOST = 'sport.health.heytapmobi.com'
 URL = 'https://' + HOST + '/sporthealth/v5/c2s/sport/steps/pullStepsDetailData'
 
 
 def validate_auth(auth):
+    if not isinstance(auth, dict):
+        raise ValueError('登录凭证必须是字段对象')
     for key in ('token', 'token_auth_id', 'ssoid'):
         value = auth.get(key)
         if not isinstance(value, str) or not value or len(value) > 4096:
@@ -27,27 +30,11 @@ def validate_auth(auth):
 
 
 def load_auth(path=AUTH_FILE):
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
-        raise ValueError('凭证文件必须由当前用户拥有，且权限为 600')
-    return validate_auth(json.loads(path.read_text()))
+    return validate_auth(read_private_json(path))
 
 
 def save_auth(auth, path=AUTH_FILE):
-    auth = validate_auth(auth)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink():
-        raise ValueError('凭证目录不能为符号链接')
-    path.parent.chmod(0o700)
-    temp = path.with_name('.auth-' + os.urandom(8).hex())
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, 'w') as out:
-            json.dump(auth, out)
-        os.replace(temp, path)
-    finally:
-        if temp.exists():
-            temp.unlink()
+    write_private_json(validate_auth(auth), path)
 
 
 def quote_config(value):
@@ -74,7 +61,7 @@ def read_today(auth, run=subprocess.run):
                        ['header = ' + quote_config(k + ': ' + v) for k, v in headers.items()] +
                        ['data-binary = ' + quote_config(body)])
     # -q ignores user curlrc; config travels via stdin, never process argv.
-    result = run(['curl', '-q', '--silent', '--show-error', '--max-time', '20',
+    result = run([curl_executable(), '-q', '--silent', '--show-error', '--max-time', '20',
                   '--proto', '=https', '--noproxy', '*', '--config', '-',
                   '--write-out', '\n%{http_code}'], input=config,
                  text=True, capture_output=True, timeout=25)

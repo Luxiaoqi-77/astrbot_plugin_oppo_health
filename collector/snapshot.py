@@ -2,12 +2,11 @@
 import concurrent.futures
 import datetime as dt
 import json
-import os
-from pathlib import Path
 
 from cloud_client import TZ, day_range, fetch
+from storage import private_root, write_private_json
 
-CACHE_FILE = Path.home() / '.local/share/astrbot-oppo-health/snapshot.json'
+CACHE_FILE = private_root() / 'snapshot.json'
 METRICS = ('steps', 'heart_rate', 'blood_oxygen', 'sleep')
 
 
@@ -93,13 +92,7 @@ def collect(date=None):
 
 
 def save(snapshot, path=CACHE_FILE):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    temp = path.with_name('.snapshot-' + os.urandom(8).hex())
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as out:
-        json.dump(snapshot, out, ensure_ascii=False)
-    os.replace(temp, path)
+    write_private_json(snapshot, path)
 
 
 def format_snapshot(snapshot):

@@ -2,11 +2,20 @@
 import subprocess
 import time
 import socket
-from start_emulator import ROOT, environment
+import os
+from runtime import ROOT, environment, sdk_tool
 
-ADB = ROOT / 'sdk/platform-tools/adb'
+ADB = sdk_tool('platform-tools/adb')
 SERIAL = '127.0.0.1:5579'
-SERVER = ROOT / 'downloads/frida-server-16.7.19-android-arm64'
+def server_path(abi):
+    architecture = {'arm64-v8a': 'arm64', 'x86_64': 'x86_64', 'armeabi-v7a': 'arm', 'x86': 'x86'}.get(abi)
+    if not architecture:
+        raise ValueError('Unsupported guest architecture')
+    from pathlib import Path
+    path = Path(os.environ.get('OPPO_HEALTH_FRIDA_SERVER', str(ROOT / ('downloads/frida-server-16.7.19-android-' + architecture))))
+    if not path.is_file():
+        raise FileNotFoundError('Install the Frida server matching the Android guest ABI')
+    return path
 REMOTE = '/data/local/tmp/astrbot-auth-inspector'
 
 def adb(*args, check=True):
@@ -27,7 +36,10 @@ def prepare():
     time.sleep(3)
     adb('connect', SERIAL, check=False)
     adb('wait-for-device')
-    adb('push', str(SERVER), REMOTE)
+    if adb('shell', 'id', '-u').stdout.strip() != '0':
+        raise RuntimeError('Dedicated auth AVD must allow adb root')
+    abi = adb('shell', 'getprop', 'ro.product.cpu.abi').stdout.strip()
+    adb('push', str(server_path(abi)), REMOTE)
     adb('shell', 'chmod', '700', REMOTE)
     adb('shell', REMOTE + ' -D -l 127.0.0.1:27042 >/dev/null 2>&1 </dev/null', check=False)
     adb('forward', 'tcp:27742', 'tcp:27042')
@@ -40,8 +52,8 @@ def main():
             raise RuntimeError('Dedicated emulator port is already occupied')
     subprocess.run([str(ADB), '-P', '5038', 'start-server'],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    proc = subprocess.Popen([str(ROOT / 'sdk/emulator/emulator'),
-        '-avd', 'AstrBot_OPPOHealth_authcheck30v2', '-port', '5578', '-memory', '2048',
+    proc = subprocess.Popen([str(sdk_tool('emulator/emulator')),
+        '-avd', os.environ.get('OPPO_HEALTH_AUTH_AVD', 'AstrBot_OPPOHealth_authcheck30v2'), '-port', '5578', '-memory', '2048',
         '-data', str(ROOT / 'auth-flat/userdata-flat.img'),
         '-encryption-key', str(ROOT / 'auth-flat/encryption-flat.img'),
         '-no-snapshot', '-no-audio', '-no-boot-anim', '-no-window', '-no-metrics'],

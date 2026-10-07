@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from probe import HOST, load_auth, quote_config, validate_auth
 from oppo_sign import sign_headers
+from runtime import curl_executable
 
 TZ = ZoneInfo('Asia/Shanghai')
 ENDPOINTS = {
@@ -37,7 +38,7 @@ def post(metric, body_obj, auth=None, run=subprocess.run):
                        ['header = ' + quote_config(k + ': ' + v) for k, v in headers.items()] +
                        ['data-binary = ' + quote_config(body)])
     try:
-        result = run(['curl', '-q', '--silent', '--show-error', '--max-time', '20',
+        result = run([curl_executable(), '-q', '--silent', '--show-error', '--max-time', '20',
                       '--proto', '=https', '--noproxy', '*', '--config', '-',
                       '--write-out', '\n%{http_code}'], input=config,
                      text=True, capture_output=True, timeout=25)

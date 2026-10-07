@@ -1,4 +1,4 @@
-"""OPPO cloud health summaries and one daily private-chat care message."""
+"""Private OPPO summaries, wake-up care and one optional daytime care."""
 import asyncio
 import datetime as dt
 import json
@@ -13,10 +13,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
 from .care_logic import due_kind, new_activity_due, wake_due
+from .collector.storage import private_root, read_private_json, write_private_json
 
 NAME = 'oppo_health'
 TZ = ZoneInfo('Asia/Shanghai')
-HEALTH_WORDS = ('健康', '心率', '血氧', '睡眠', '步数', '手表', '运动', '不舒服', '累', '困', '没睡', '熬夜')
+HEALTH_WORDS = ('健康', '心率', '血氧', '睡眠', '步数', '手表', '运动', '不舒服', '累', '困', '没睡', '熬夜', '睡得', '睡了', '走了', '跑步', '锻炼')
 
 
 def describe(snapshot):
@@ -48,7 +49,7 @@ class OPPOHealth(Star):
         super().__init__(context)
         self.config = config
         self.umo = str(config.get('private_session', ''))
-        self.root = Path.home() / '.local/share/astrbot-oppo-health'
+        self.root = private_root()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.state_path = self.root / 'daily-care.json'
         self._cache = None
@@ -140,7 +141,7 @@ class OPPOHealth(Star):
             return '日期格式应为 YYYY-MM-DD。'
         if not today - dt.timedelta(days=6) <= requested <= today:
             return '仅支持最近七天的健康记录。'
-        snapshot = await self._snapshot(requested.isoformat())
+        snapshot = await self._snapshot(requested.isoformat(), force=True)
         return describe(snapshot) if snapshot else '暂时没有可用数据，不要推测数值。'
 
     @filter.on_llm_request()
@@ -153,16 +154,16 @@ class OPPOHealth(Star):
         self._last_user_activity = dt.datetime.now(TZ)
         if not any(word in text for word in HEALTH_WORDS):
             return
-        snapshot = await self._snapshot()
+        snapshot = await self._snapshot(force=True)
         if snapshot:
             req.system_prompt += '\n[本人健康记录，仅用于本次健康话题]\n' + describe(snapshot) + (
-                '\n沿用当前人格的性格和语气自然回应，保留测量时间的含义；不要诊断，不要罗列全部数值，'
+                '\n沿用当前人格的性格和语气自然回应，不要把读取时间当测量时间，旧记录不能说成实时值。通常不报精确测量时间；只有记录较旧、容易误认实时或用户追问时，才用“上午那次记录”等自然说法说明。不要诊断，不要罗列全部数值，'
                 '不要声称实时监控或能控制手表。\n')
 
     def _state(self, now, snapshot):
         if self.state_path.exists():
             try:
-                state = json.loads(self.state_path.read_text())
+                state = read_private_json(self.state_path)
                 if state.get('date') == now.date().isoformat():
                     return state
             except (ValueError, OSError):
@@ -173,11 +174,7 @@ class OPPOHealth(Star):
         return state
 
     def _save_state(self, state):
-        temp = self.state_path.with_name('.daily-care-' + os.urandom(8).hex())
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, 'w') as out:
-            json.dump(state, out)
-        os.replace(temp, self.state_path)
+        write_private_json(state, self.state_path)
 
     async def _care(self, now):
         if not self.config.get('daily_care', False):
@@ -210,7 +207,7 @@ class OPPOHealth(Star):
         topic = ('用户手表记录的起床时间已过去约一小时，关心昨晚睡眠。'
                  if kind == 'sleep' else '这是今天随机安排的一次活动关怀，关心运动、久坐休息或最近一次心率。')
         prompt = ('[OPPO每日关怀] ' + topic + ' 请沿用当前人格的性格和语气主动发一小段自然问候，'
-                  '选一项有记录的情况轻轻关心即可，不要逐项报表，不诊断、不夸大，不说实时监控。'
+                  '选一项有记录的情况轻轻关心即可，不要逐项报表，通常不报精确测量时间；旧记录需要说明时用“上午那次记录”等自然说法，不把旧测量当实时值。不诊断、不夸大，不说实时监控。'
                   '没有记录就温柔询问今天过得怎么样。\n' +
                   (describe(snapshot) if snapshot else '今天暂时无法读取记录。'))
         uid = int(parts[2])

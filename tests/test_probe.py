@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 import probe
+from storage import is_windows
 
 
 class ProbeTests(unittest.TestCase):
@@ -16,14 +17,19 @@ class ProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'private' / 'auth.json'
             probe.save_auth(self.auth, path)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+            if not is_windows():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
             self.assertEqual(probe.load_auth(path), self.auth)
-            path.chmod(0o644)
-            with self.assertRaises(ValueError):
-                probe.load_auth(path)
+            if not is_windows():
+                path.chmod(0o644)
+                with self.assertRaises(ValueError):
+                    probe.load_auth(path)
 
     def test_bad_credentials_rejected(self):
+        for invalid in (None, [], 'not-a-map'):
+            with self.assertRaises(ValueError):
+                probe.validate_auth(invalid)
         for change in ({'token': 'wrong'}, {'ssoid': ''}, {'token_auth_id': 'secret\nheader'}):
             with self.assertRaises(ValueError):
                 probe.read_today(dict(self.auth, **change), lambda *a, **k: self.fail('must not send'))

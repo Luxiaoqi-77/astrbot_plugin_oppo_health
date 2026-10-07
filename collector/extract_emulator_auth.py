@@ -6,7 +6,7 @@ import json
 import frida
 
 from probe import save_auth, validate_auth
-from start_emulator import ROOT
+from runtime import sdk_tool
 
 
 SCRIPT = """
@@ -26,7 +26,7 @@ Java.perform(function () {
 
 
 def extract():
-    adb = ROOT / 'sdk/platform-tools/adb'
+    adb = sdk_tool('platform-tools/adb')
     pid = subprocess.check_output(
         [str(adb), '-P', '5038', '-s', '127.0.0.1:5579', 'shell', 'pidof', 'com.heytap.health'],
         text=True, timeout=10).strip().split()[0]

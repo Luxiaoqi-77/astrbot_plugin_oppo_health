@@ -2,5 +2,5 @@ name: oppo_health
 display_name: OPPO 健康关怀
 author: Luxiaoqi-77
 desc: 本人 OPPO 健康查询、醒后一小时睡眠关怀与随机运动心率关怀，沿用当前人格。
-version: 0.1.0
+version: 0.2.0
 repo: https://github.com/Luxiaoqi-77/astrbot_plugin_oppo_health
