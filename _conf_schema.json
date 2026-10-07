@@ -1,0 +1,50 @@
+{
+  "private_session": {
+    "type": "string",
+    "description": "本人 QQ 私聊会话 UMO",
+    "hint": "格式 平台ID:FriendMessage:本人QQ号。为空时后台不会启动，其他用户和群聊无权读取。",
+    "default": ""
+  },
+  "bot_qq_id": {
+    "type": "string",
+    "description": "机器人 QQ 号",
+    "hint": "开启主动关怀前填写。",
+    "default": ""
+  },
+  "daily_care": {
+    "type": "bool",
+    "description": "开启睡眠关怀",
+    "hint": "按主睡眠起床时间后一小时；北京时间。",
+    "default": false
+  },
+  "random_activity_care": {
+    "type": "bool",
+    "description": "另加每天一次随机运动心率关怀",
+    "hint": "需先开启睡眠关怀总开关。14–21 点，最近聊天 30 分钟内推迟。",
+    "default": true
+  },
+  "auth_file": {
+    "type": "string",
+    "description": "凭证文件路径",
+    "hint": "留空使用 ~/.local/share/astrbot-oppo-health/auth.json。不要把凭证本身粘贴到此处。",
+    "default": ""
+  },
+  "collector_python": {
+    "type": "string",
+    "description": "读取程序 Python 路径",
+    "hint": "留空使用 AstrBot 当前 Python。",
+    "default": ""
+  },
+  "collector_script": {
+    "type": "string",
+    "description": "读取程序脚本路径",
+    "hint": "留空使用插件内置 collector/snapshot.py。",
+    "default": ""
+  },
+  "emulator_auth_refresh": {
+    "type": "bool",
+    "description": "凭证失效时尝试模拟器重新读取",
+    "hint": "仅在完成 docs/EMULATOR_AUTH.md 的专用模拟器配置后开启。不保证永久续期。",
+    "default": false
+  }
+}

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+auth.json
+*auth*.local.json
+snapshot.json
+daily-care.json
+*.log
+*.apk
+*.img
+*.qcow2
+emulator/
+data/
+.DS_Store

@@ -1,0 +1,1 @@
+# Runtime uses AstrBot and Python standard library; curl is an OS prerequisite.
