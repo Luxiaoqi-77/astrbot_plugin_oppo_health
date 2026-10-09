@@ -13,7 +13,7 @@
         <div>
           <p class="eyebrow">OPPO 健康 · 本机设置</p>
           <h1>关怀设置</h1>
-          <p class="intro">查看现有开关、数据状态和关怀规则。新规则需要你确认后才会启用。</p>
+          <p class="intro">查看现有开关、来源时间、触发状态和每类关怀规则；规则按类别各自运行。</p>
         </div>
         <div id="connection-status" class="demo-pill" role="status">
           <span class="demo-dot" aria-hidden="true"></span>
@@ -29,7 +29,7 @@
       <section class="summary-grid" aria-label="关怀概况">
         <article class="summary-card">
           <span class="summary-label">已开启的新规则</span>
-          <strong id="enabled-count" class="summary-value">— / 4</strong>
+          <strong id="enabled-count" class="summary-value">— / 7</strong>
           <span class="summary-hint">新规则默认关闭</span>
         </article>
         <article class="summary-card">
@@ -53,7 +53,7 @@
           <span id="evaluated-at" class="section-aside">尚未读取</span>
         </div>
         <div class="data-grid" id="data-grid" aria-live="polite"></div>
-        <p class="subtle-note">页面只显示来源日期和是否过期，不显示体重等数值。来源未接入时不会虚构日期。</p>
+        <p class="subtle-note">页面显示来源日期、测量与读取时间、分类和可用性；不会显示体重或状态分值。来源未接入时不会虚构日期。</p>
       </section>
 
       <section class="section-block" aria-labelledby="existing-title">
@@ -65,14 +65,14 @@
           <span class="section-aside">沿用插件现有设置</span>
         </div>
         <div class="data-grid" id="existing-care-grid"></div>
-        <p class="subtle-note">这里仅查看当前开关，不修改睡眠关怀和活动关怀的原有行为。</p>
+        <p class="subtle-note">睡眠每条新的有效醒来记录按 50% 独立抽签，长期约两天一次，不按固定隔天；抽中后从 OPPO 记录的实际醒来时间起，随机等待 60–120 分钟。22:00–08:00 静默；本人睡前直接说晚安后，当天剩余时间不再主动打扰。其他步数等原有关怀合计每天最多 2 次，来源、时段或安全条件不满足时会跳过，不保证每天发送。经期、体重、状态和日照按各自开关、去重和频率运行，不共用每日上限或最短间隔。本人主动查询不计入主动关怀。</p>
       </section>
 
       <section class="section-block" aria-labelledby="rules-title">
         <div class="section-heading rules-heading">
           <div>
             <p class="eyebrow">规则配置</p>
-            <h2 id="rules-title">以后可以添加的关怀</h2>
+            <h2 id="rules-title">经期、体重、状态与日照</h2>
           </div>
           <button class="button button-secondary" id="preview-button" type="button" disabled>预览安排</button>
         </div>

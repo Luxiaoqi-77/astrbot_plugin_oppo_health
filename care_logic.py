@@ -3,6 +3,7 @@ import datetime as dt
 import hashlib
 import math
 import random
+import re
 from zoneinfo import ZoneInfo
 
 
@@ -152,6 +153,22 @@ def new_activity_due(now, sleep_due=None, chooser=random.randint):
     return (start + dt.timedelta(seconds=chooser(0, max(0, int((end-start).total_seconds()) - 1)))).isoformat()
 
 
+def choose_sleep_care(record_id, wake_time, rng=random):
+    """Persist one 50% choice and 60–120 minute delay per new sleep record."""
+    if not isinstance(record_id, str) or not record_id:
+        raise ValueError('record_id is required')
+    if not isinstance(wake_time, dt.datetime) or wake_time.tzinfo is None or wake_time.utcoffset() is None:
+        raise ValueError('wake_time must be timezone-aware')
+    selected = rng.random() < 0.5
+    delay = rng.randint(60, 120)
+    return {
+        'record_id': record_id,
+        'selected': selected,
+        'delay_minutes': delay,
+        'due_at': (wake_time + dt.timedelta(minutes=delay)).isoformat() if selected else None,
+    }
+
+
 def due_kind(state, snapshot, now, activated_at, last_user_activity=None):
     if (not isinstance(now, dt.datetime) or now.tzinfo is None
             or now.utcoffset() is None):
@@ -159,21 +176,65 @@ def due_kind(state, snapshot, now, activated_at, last_user_activity=None):
     local_now = now.astimezone(SHANGHAI)
     if state.get('date') != local_now.date().isoformat():
         return None
+    if state.get('goodnight_date') == local_now.date().isoformat():
+        return None
 
     record = sleep_record(snapshot, now)
     due = record['due_at'] if record else None
-    if (record and sleep_candidate_is_stable(state, record['record_id'])
+    if record and state.get('sleep_plan_record_id') == record['record_id']:
+        due = _timestamp(state.get('sleep_care_due_at'))
+        if state.get('sleep_care_selected') is not True:
+            due = None
+    if (record and due is not None and sleep_candidate_is_stable(state, record['record_id'])
             and due >= activated_at and now >= due and now <= due + LATE_GRACE
             and not state.get('sleep_attempted')
             and state.get('sleep_attempted_record_id') != record['record_id']
-            and local_now.hour < 23):
+            and not (local_now.hour >= 22 or local_now.hour < 8)):
         return 'sleep'
 
     if state.get('activity_attempted') or not state.get('activity_due') or not 14 <= local_now.hour < 21:
         return None
     target = _timestamp(state.get('activity_due'))
-    if target is None or now < target or (due and now < due + dt.timedelta(hours=2)):
+    if (target is None or target < activated_at or target.astimezone(SHANGHAI).date() != local_now.date()
+            or now < target or (due and now < due + dt.timedelta(hours=2))):
         return None
     if last_user_activity and now - last_user_activity < dt.timedelta(minutes=30):
         return None
     return 'activity'
+
+
+def legacy_dispatch_skip_reason(kind, target_at, now, activated_at):
+    """Fail closed if a legacy sleep/activity candidate crosses its send window."""
+    if (kind not in {'sleep', 'activity'} or not isinstance(now, dt.datetime)
+            or now.tzinfo is None or now.utcoffset() is None
+            or not isinstance(activated_at, dt.datetime)
+            or activated_at.tzinfo is None or activated_at.utcoffset() is None):
+        return 'invalid_window'
+    target = _timestamp(target_at)
+    if target is None:
+        return 'invalid_window'
+    if target < activated_at:
+        return 'before_activation'
+    if target > now:
+        return 'not_due'
+    local_now = now.astimezone(SHANGHAI)
+    if target.astimezone(SHANGHAI).date() != local_now.date():
+        return 'expired'
+    if kind == 'sleep':
+        if local_now.hour < 8 or local_now.hour >= 22 or now > target + LATE_GRACE:
+            return 'quiet_or_expired'
+    elif not 14 <= local_now.hour < 21:
+        return 'quiet_or_expired'
+    return None
+
+
+def explicit_goodnight_message(text, *, own_private_plain_message):
+    """Recognize a direct bedtime sign-off without retaining the message text."""
+    if (not own_private_plain_message or not isinstance(text, str)
+            or "\n" in text or "\r" in text
+            or any(mark in text for mark in ('"', "'", "“", "”", "‘", "’", "「", "」", "『", "』", "<", ">", "《", "》"))):
+        return False
+    normalized = re.sub(r"[，。！？!?.,；;：:…]+$", "", text.strip()).casefold()
+    if normalized in {"晚安", "晚安啦", "晚安哦", "good night", "goodnight"}:
+        return True
+    return bool(re.search(r"(?:我|先)(?:准备|要|去|先)?(?:睡了|睡觉了|休息了)$", normalized))

@@ -13,13 +13,19 @@
         "predicted_period_lead",
         "confirmed_period_start",
         "confirmed_period_end",
-        "weight_date_linked"
+        "period_late_inquiry",
+        "weight_date_linked",
+        "wellness_low_state",
+        "sunlight_evening"
       ],
       "properties": {
         "predicted_period_lead": { "$ref": "#/$defs/periodLeadRule" },
         "confirmed_period_start": { "$ref": "#/$defs/rule" },
         "confirmed_period_end": { "$ref": "#/$defs/rule" },
-        "weight_date_linked": { "$ref": "#/$defs/rule" }
+        "period_late_inquiry": { "$ref": "#/$defs/periodLateInquiryRule" },
+        "weight_date_linked": { "$ref": "#/$defs/rule" },
+        "wellness_low_state": { "$ref": "#/$defs/wellnessRule" },
+        "sunlight_evening": { "$ref": "#/$defs/sunlightRule" }
       }
     }
   },
@@ -39,13 +45,13 @@
         "enabled": { "type": "boolean", "default": false },
         "timezone": { "type": "string", "default": "Asia/Shanghai" },
         "send_window": { "$ref": "#/$defs/window", "default": { "start": "09:00", "end": "21:00" } },
-        "max_per_day": { "type": "integer", "minimum": 1, "maximum": 5, "default": 1 },
+        "max_per_day": { "type": "integer", "minimum": 1, "maximum": 7, "default": 1 },
         "duplicate_window_minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "default": 30 },
         "quiet_hours": { "$ref": "#/$defs/window", "default": { "start": "22:00", "end": "08:00" } },
         "tone": { "enum": ["gentle", "brief"], "default": "gentle" },
         "stale_after_hours": { "type": "integer", "minimum": 1, "maximum": 336, "default": 48 },
         "deduplication": { "enum": ["per_event", "per_local_date"], "default": "per_event" },
-        "reschedule": { "enum": ["next_allowed_window", "skip_if_late"], "default": "next_allowed_window" }
+        "reschedule": { "enum": ["skip_if_late"], "default": "skip_if_late" }
       }
     },
     "rule": {
@@ -62,6 +68,26 @@
       ],
       "unevaluatedProperties": false
     },
+    "sunlightRule": {
+      "allOf": [
+        { "$ref": "#/$defs/rule" },
+        {
+          "type": "object",
+          "properties": {
+            "send_window": {
+              "allOf": [
+                { "$ref": "#/$defs/window" },
+                { "properties": {
+                  "start": { "const": "20:00" },
+                  "end": { "const": "21:00" }
+                } }
+              ],
+              "default": { "start": "20:00", "end": "21:00" }
+            }
+          }
+        }
+      ]
+    },
     "periodLeadRule": {
       "allOf": [
         { "$ref": "#/$defs/commonFields" },
@@ -72,7 +98,58 @@
             "duplicate_window_minutes",
             "tone", "stale_after_hours", "deduplication", "reschedule", "lead_days"
           ],
-          "properties": { "lead_days": { "type": "integer", "minimum": 1, "maximum": 14, "default": 3 } }
+          "properties": { "lead_days": { "const": 3, "default": 3 } }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "periodLateInquiryRule": {
+      "allOf": [
+        { "$ref": "#/$defs/commonFields" },
+        {
+          "type": "object",
+          "required": [
+            "enabled", "timezone", "send_window", "max_per_day", "quiet_hours",
+            "duplicate_window_minutes", "tone", "stale_after_hours", "deduplication",
+            "reschedule", "start_day", "probability", "cooldown_days", "observation_window_days"
+          ],
+          "properties": {
+            "max_per_day": { "type": "integer", "const": 1, "default": 1 },
+            "start_day": { "type": "integer", "minimum": 4, "maximum": 30, "default": 4 },
+            "probability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.5 },
+            "cooldown_days": { "type": "integer", "minimum": 1, "maximum": 30, "default": 1 },
+            "observation_window_days": { "type": "integer", "minimum": 4, "maximum": 60, "default": 14 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "wellnessRule": {
+      "allOf": [
+        { "$ref": "#/$defs/commonFields" },
+        {
+          "type": "object",
+          "required": [
+            "enabled", "timezone", "send_window", "max_per_day", "quiet_hours",
+            "duplicate_window_minutes", "tone", "stale_after_hours", "deduplication",
+            "reschedule", "mode", "timezone_confirmed", "low_score_threshold",
+            "confirmation_minutes", "minimum_independent_samples", "recovery_score_threshold",
+            "recovery_debounce_minutes", "maximum_sample_age_minutes",
+            "repeat_cooldown_minutes", "weekly_target"
+          ],
+          "properties": {
+            "max_per_day": { "type": "integer", "const": 7, "default": 7 },
+            "mode": { "enum": ["unconfirmed", "numeric", "slow_down_category"], "default": "unconfirmed" },
+            "timezone_confirmed": { "type": "boolean", "default": false },
+            "low_score_threshold": { "type": ["integer", "null"], "minimum": 0, "maximum": 999 },
+            "confirmation_minutes": { "type": ["integer", "null"], "minimum": 1, "maximum": 1440 },
+            "minimum_independent_samples": { "type": ["integer", "null"], "minimum": 2, "maximum": 100 },
+            "recovery_score_threshold": { "type": ["integer", "null"], "minimum": 0, "maximum": 999 },
+            "recovery_debounce_minutes": { "type": ["integer", "null"], "minimum": 1, "maximum": 1440 },
+            "maximum_sample_age_minutes": { "type": ["integer", "null"], "minimum": 1, "maximum": 1440 },
+            "repeat_cooldown_minutes": { "type": ["integer", "null"], "minimum": 1, "maximum": 10080 },
+            "weekly_target": { "type": "integer", "minimum": 1, "maximum": 7, "default": 5 }
+          }
         }
       ],
       "unevaluatedProperties": false

@@ -12,6 +12,71 @@ from typing import Any
 from .care_rules import RULE_IDS, default_config, validate_config
 
 
+_V03_RULE_IDS = {
+    "predicted_period_lead", "confirmed_period_start", "confirmed_period_end",
+    "weight_date_linked",
+}
+_PRE_LATE_PERIOD_RULE_IDS = set(RULE_IDS) - {"period_late_inquiry"}
+
+
+def _upgrade_v03_config(value: object) -> object:
+    """Upgrade the original v0.3 shape and discard the superseded global cap."""
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        return value
+    rules = value.get("rules")
+    if not isinstance(rules, dict):
+        return value
+    if set(rules) == _V03_RULE_IDS:
+        upgraded = default_config()
+        upgraded["rules"].update(rules)
+        predicted = upgraded["rules"].get("predicted_period_lead")
+        if isinstance(predicted, dict):
+            predicted["lead_days"] = 3
+        for rule in upgraded["rules"].values():
+            if isinstance(rule, dict):
+                rule["reschedule"] = "skip_if_late"
+        return upgraded
+    if (set(rules) in (
+            set(RULE_IDS),
+            _PRE_LATE_PERIOD_RULE_IDS,
+        )
+            and set(value) in ({"schema_version", "rules"}, {"schema_version", "rules", "health_budget"})):
+        # A previous local candidate offered a cross-category daily cap. The
+        # user's final policy explicitly exempts these category rules, so do
+        # not carry that obsolete limiter into the saved configuration.
+        upgraded_rules = default_config()["rules"]
+        upgraded_rules.update({key: dict(item) if isinstance(item, dict) else item for key, item in rules.items()})
+        if isinstance(upgraded_rules.get("predicted_period_lead"), dict):
+            upgraded_rules["predicted_period_lead"]["lead_days"] = 3
+        for rule_id, rule in upgraded_rules.items():
+            if isinstance(rule, dict):
+                rule["max_per_day"] = 7 if rule_id == "wellness_low_state" else 1
+                rule["reschedule"] = "skip_if_late"
+                if rule_id == "sunlight_evening":
+                    rule["send_window"] = {"start": "20:00", "end": "21:00"}
+        wellness = upgraded_rules.get("wellness_low_state")
+        if isinstance(wellness, dict):
+            mode = wellness.get("mode")
+            common = (
+                "confirmation_minutes", "minimum_independent_samples",
+                "recovery_debounce_minutes", "maximum_sample_age_minutes",
+                "repeat_cooldown_minutes",
+            )
+            confirmed = (
+                mode in {"numeric", "slow_down_category"}
+                and wellness.get("timezone_confirmed") is True
+                and all(wellness.get(name) is not None for name in common)
+                and (mode != "numeric" or (
+                    wellness.get("low_score_threshold") is not None
+                    and wellness.get("recovery_score_threshold") is not None
+                ))
+            )
+            if not confirmed:
+                wellness["enabled"] = False
+        return {"schema_version": 1, "rules": upgraded_rules}
+    return value
+
+
 class CareStorageError(RuntimeError):
     """Raised when persisted care data cannot be safely read or written."""
 
@@ -91,6 +156,7 @@ class CareRepository:
         self._ensure_directory()
         self.config_path = self.directory / "care-rules.json"
         self.state_path = self.directory / "scheduler-state.json"
+        self.wellness_state_path = self.directory / "wellness-runtime.json"
 
     def _ensure_directory(self) -> None:
         try:
@@ -170,7 +236,7 @@ class CareRepository:
             if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
                 raise CareStorageError("care configuration revision is invalid")
             try:
-                config = validate_config(raw.get("config"))
+                config = validate_config(_upgrade_v03_config(raw.get("config")))
             except ValueError as exc:
                 raise CareStorageError("care configuration is invalid") from exc
             return config, revision
@@ -200,3 +266,27 @@ class CareRepository:
         normalized = _validate_scheduler_state(state)
         with self._lock:
             self._atomic_write(self.state_path, normalized)
+
+    def load_wellness_state(self) -> dict[str, Any]:
+        """Load private score-free state used for source-sample and slot dedupe."""
+        from .care_wellness import empty_runtime_state, validate_runtime_state
+
+        with self._lock:
+            raw = self._read_json(self.wellness_state_path)
+            if raw is None:
+                return empty_runtime_state()
+            try:
+                return validate_runtime_state(raw)
+            except ValueError as exc:
+                raise CareStorageError("wellness runtime state is invalid") from exc
+
+    def save_wellness_state(self, state: object) -> None:
+        """Atomically persist only allowlisted episode identifiers and timestamps."""
+        from .care_wellness import validate_runtime_state
+
+        try:
+            normalized = validate_runtime_state(state)
+        except ValueError as exc:
+            raise CareStorageError("wellness runtime state is invalid") from exc
+        with self._lock:
+            self._atomic_write(self.wellness_state_path, normalized)

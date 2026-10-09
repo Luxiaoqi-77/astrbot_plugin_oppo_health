@@ -86,6 +86,23 @@ class CareApiTests(unittest.TestCase):
                     "source": "predicted_period", "status": "unavailable",
                     "data_date": None, "observed_at": None, "is_stale": None,
                     "reason": "本机安全预检尚未接通",
+                }, {
+                    "source": "confirmed_period_end", "status": "unsupported",
+                    "data_date": None, "observed_at": "2026-10-09T08:15:00+08:00",
+                    "is_stale": None, "reason": "当前来源未提供明确的经期结束事件",
+                }, {
+                    "source": "period_late_inquiry", "status": "unsupported",
+                    "data_date": None, "observed_at": "2026-10-09T08:15:00+08:00",
+                    "is_stale": None, "evaluation_state": "unsupported",
+                    "reason": "来源没有同时提供明确经期开始和结束事件通道；后段询问保持暂停",
+                }, {
+                    "source": "wellness_low_state", "status": "ok",
+                    "data_date": "2026-10-09", "observed_at": "2026-10-09T08:20:00+08:00",
+                    "measured_at": "2026-10-09T08:15:00+08:00", "category": "Slow down",
+                    "quality": "来源未提供质量标签",
+                    "completeness": "解析成功，日期、分类、真实测量时刻和更新时间齐全；质量标签未独立核验",
+                    "evaluation_state": "confirming_low_state", "is_stale": False,
+                    "reason": "等待下一条新鲜独立测量样本",
                 }],
             }
         self.api = self.module.CarePageAPI(
@@ -122,6 +139,47 @@ class CareApiTests(unittest.TestCase):
         self.assertEqual(payload["privacy_status"]["last_route_error_code"], "preflight_unavailable")
         self.assertFalse(any("value" in source for source in payload["data_sources"]))
         self.assertTrue(all(not row["enabled"] for row in payload["rules"]))
+
+    def test_rule_page_status_includes_unsupported_reason_and_source_times(self):
+        config, revision = self.repository.load_config()
+        config["rules"]["confirmed_period_end"]["enabled"] = True
+        config["rules"]["period_late_inquiry"]["enabled"] = True
+        config["rules"]["wellness_low_state"].update(
+            enabled=True, mode="slow_down_category", timezone_confirmed=True,
+            confirmation_minutes=15, minimum_independent_samples=2,
+            recovery_debounce_minutes=15, maximum_sample_age_minutes=30,
+            repeat_cooldown_minutes=240,
+        )
+        self.repository.save_config(config, revision)
+        scheduler_state = self.repository.load_scheduler_state()
+        scheduler_state["jobs"]["late-history"] = {
+            "event_key": "f" * 64,
+            "rule_id": "period_late_inquiry",
+            "target_date": "2026-10-08",
+            "basis": "后段询问机会",
+            "expected_at": "2026-10-08T09:00:00+08:00",
+            "window_end": "2026-10-08T21:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "source_observed_at": "2026-10-08T09:00:00+08:00",
+            "is_actual_event": True,
+            "state": "handed_off",
+            "reason": "旧的候选交接状态",
+        }
+        self.repository.save_scheduler_state(scheduler_state)
+        response = asyncio.run(self.api.state())
+        rows = {row["rule_id"]: row for row in response.data["rules"]}
+        self.assertEqual(rows["confirmed_period_end"]["state"], "unsupported")
+        self.assertIn("未提供明确的经期结束事件", rows["confirmed_period_end"]["reason"])
+        self.assertEqual(rows["confirmed_period_end"]["checked_at"], "2026-10-09T08:15:00+08:00")
+        self.assertEqual(rows["period_late_inquiry"]["state"], "unsupported")
+        self.assertIn("明确经期开始和结束事件通道", rows["period_late_inquiry"]["reason"])
+        self.assertEqual(rows["period_late_inquiry"]["checked_at"], "2026-10-09T08:15:00+08:00")
+        self.assertEqual(rows["wellness_low_state"]["state"], "confirming_low_state")
+        self.assertEqual(rows["wellness_low_state"]["measured_at"], "2026-10-09T08:15:00+08:00")
+        wellness = next(
+            item for item in response.data["data_sources"] if item["source"] == "wellness_low_state"
+        )
+        self.assertIn("质量标签未独立核验", wellness["completeness"])
 
     def test_privacy_status_sanitizes_readiness(self):
         response = asyncio.run(self.api.privacy_status())
@@ -177,6 +235,12 @@ class CareApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["revision"], 1)
         self.assertTrue(response.data["config"]["rules"]["weight_date_linked"]["enabled"])
+
+        reread = asyncio.run(self.api.state())
+        self.assertEqual(reread.status_code, 200)
+        self.assertEqual(reread.data["revision"], response.data["revision"])
+        self.assertEqual(reread.data["config"], response.data["config"])
+        self.assertEqual(len(reread.data["rules"]), 7)
 
         response = asyncio.run(self.api.save_config())
         self.assertEqual(response.status_code, 409)

@@ -12,17 +12,22 @@ RULE_IDS = (
     "predicted_period_lead",
     "confirmed_period_start",
     "confirmed_period_end",
+    "period_late_inquiry",
     "weight_date_linked",
+    "wellness_low_state",
+    "sunlight_evening",
 )
 _RULE_FACTS = {
     "predicted_period_lead": "predicted_period",
     "confirmed_period_start": "confirmed_period_start",
     "confirmed_period_end": "confirmed_period_end",
+    "period_late_inquiry": "period_late_inquiry",
     "weight_date_linked": "weight_entry",
+    "wellness_low_state": "wellness_low_state",
+    "sunlight_evening": "sunlight_evening",
 }
 _TONES = {"gentle", "brief"}
 _DEDUPLICATION = {"per_event", "per_local_date"}
-_RESCHEDULE = {"next_allowed_window", "skip_if_late"}
 
 
 def _rule_default(*, lead_days: int | None = None) -> dict[str, Any]:
@@ -36,11 +41,40 @@ def _rule_default(*, lead_days: int | None = None) -> dict[str, Any]:
         "tone": "gentle",
         "stale_after_hours": 48,
         "deduplication": "per_event",
-        "reschedule": "next_allowed_window",
+        "reschedule": "skip_if_late",
     }
     if lead_days is not None:
         rule["lead_days"] = lead_days
     return rule
+
+
+def _wellness_rule_default() -> dict[str, Any]:
+    """Return a closed status rule with deliberately unconfirmed thresholds."""
+    return {
+        **_rule_default(),
+        "max_per_day": 7,
+        "mode": "unconfirmed",
+        "timezone_confirmed": False,
+        "low_score_threshold": None,
+        "confirmation_minutes": None,
+        "minimum_independent_samples": None,
+        "recovery_score_threshold": None,
+        "recovery_debounce_minutes": None,
+        "maximum_sample_age_minutes": None,
+        "repeat_cooldown_minutes": None,
+        "weekly_target": 5,
+    }
+
+
+def _period_late_inquiry_default() -> dict[str, Any]:
+    """Return a closed, explicitly event-gated late-cycle inquiry rule."""
+    return {
+        **_rule_default(),
+        "start_day": 4,
+        "probability": 0.5,
+        "cooldown_days": 1,
+        "observation_window_days": 14,
+    }
 
 
 def default_config() -> dict[str, Any]:
@@ -55,7 +89,15 @@ def default_config() -> dict[str, Any]:
             "predicted_period_lead": _rule_default(lead_days=3),
             "confirmed_period_start": _rule_default(),
             "confirmed_period_end": _rule_default(),
+            "period_late_inquiry": _period_late_inquiry_default(),
             "weight_date_linked": _rule_default(),
+            "wellness_low_state": _wellness_rule_default(),
+            "sunlight_evening": {
+                **_rule_default(),
+                "send_window": {"start": "20:00", "end": "21:00"},
+                "quiet_hours": {"start": "21:00", "end": "08:00"},
+                "max_per_day": 1,
+            },
         },
     }
 
@@ -130,7 +172,19 @@ def validate_config(payload: object) -> dict[str, Any]:
         rule = rules[rule_id]
         if not isinstance(rule, dict):
             raise ValueError(f"{rule_id} must be an object")
-        fields = expected_fields | ({"lead_days"} if rule_id == "predicted_period_lead" else set())
+        extra_fields = set()
+        if rule_id == "predicted_period_lead":
+            extra_fields = {"lead_days"}
+        elif rule_id == "period_late_inquiry":
+            extra_fields = {"start_day", "probability", "cooldown_days", "observation_window_days"}
+        elif rule_id == "wellness_low_state":
+            extra_fields = {
+                "mode", "timezone_confirmed", "low_score_threshold", "confirmation_minutes",
+                "minimum_independent_samples", "recovery_score_threshold",
+                "recovery_debounce_minutes", "maximum_sample_age_minutes",
+                "repeat_cooldown_minutes", "weekly_target",
+            }
+        fields = expected_fields | extra_fields
         if set(rule) != fields:
             raise ValueError(f"{rule_id} contains missing or unsupported fields")
         if not isinstance(rule["enabled"], bool):
@@ -144,14 +198,19 @@ def validate_config(payload: object) -> dict[str, Any]:
             raise ValueError(f"{rule_id}.timezone is not a known IANA timezone") from exc
 
         send_window = _validate_window(rule["send_window"], f"{rule_id}.send_window", overnight=False)
+        if rule_id == "sunlight_evening" and send_window != {"start": "20:00", "end": "21:00"}:
+            raise ValueError("sunlight_evening check window is fixed at 20:00–21:00")
         quiet_hours = _validate_window(rule["quiet_hours"], f"{rule_id}.quiet_hours", overnight=True)
         _ensure_send_window_respects_quiet_hours(send_window, quiet_hours, rule_id)
 
         max_per_day = rule["max_per_day"]
         duplicate_window_minutes = rule["duplicate_window_minutes"]
         stale_after_hours = rule["stale_after_hours"]
-        if isinstance(max_per_day, bool) or not isinstance(max_per_day, int) or not 1 <= max_per_day <= 5:
-            raise ValueError(f"{rule_id}.max_per_day must be between 1 and 5")
+        if isinstance(max_per_day, bool) or not isinstance(max_per_day, int) or not 1 <= max_per_day <= 7:
+            raise ValueError(f"{rule_id}.max_per_day must be between 1 and 7")
+        required_daily_cap = 7 if rule_id == "wellness_low_state" else 1
+        if max_per_day != required_daily_cap:
+            raise ValueError(f"{rule_id}.max_per_day is fixed at {required_daily_cap}")
         if (isinstance(duplicate_window_minutes, bool)
                 or not isinstance(duplicate_window_minutes, int)
                 or not 1 <= duplicate_window_minutes <= 1440):
@@ -164,8 +223,8 @@ def validate_config(payload: object) -> dict[str, Any]:
         if (not isinstance(rule["deduplication"], str)
                 or rule["deduplication"] not in _DEDUPLICATION):
             raise ValueError(f"{rule_id}.deduplication is unsupported")
-        if not isinstance(rule["reschedule"], str) or rule["reschedule"] not in _RESCHEDULE:
-            raise ValueError(f"{rule_id}.reschedule is unsupported")
+        if rule["reschedule"] != "skip_if_late":
+            raise ValueError(f"{rule_id}.reschedule must skip missed windows; history is never replayed")
 
         normalized_rule = {
             "enabled": rule["enabled"],
@@ -181,9 +240,85 @@ def validate_config(payload: object) -> dict[str, Any]:
         }
         if rule_id == "predicted_period_lead":
             lead_days = rule["lead_days"]
-            if isinstance(lead_days, bool) or not isinstance(lead_days, int) or not 1 <= lead_days <= 14:
-                raise ValueError("predicted_period_lead.lead_days must be between 1 and 14")
+            if isinstance(lead_days, bool) or not isinstance(lead_days, int) or lead_days != 3:
+                raise ValueError("predicted_period_lead.lead_days is fixed at 3 days")
             normalized_rule["lead_days"] = lead_days
+        elif rule_id == "period_late_inquiry":
+            start_day = rule["start_day"]
+            cooldown_days = rule["cooldown_days"]
+            observation_window_days = rule["observation_window_days"]
+            probability = rule["probability"]
+            if isinstance(start_day, bool) or not isinstance(start_day, int) or not 4 <= start_day <= 30:
+                raise ValueError("period_late_inquiry.start_day must be between 4 and 30")
+            if isinstance(cooldown_days, bool) or not isinstance(cooldown_days, int) or not 1 <= cooldown_days <= 30:
+                raise ValueError("period_late_inquiry.cooldown_days must be between 1 and 30")
+            if (isinstance(observation_window_days, bool)
+                    or not isinstance(observation_window_days, int)
+                    or not start_day <= observation_window_days <= 60):
+                raise ValueError("period_late_inquiry.observation_window_days must be at least start_day and at most 60")
+            if (isinstance(probability, bool) or not isinstance(probability, (int, float))
+                    or not 0 <= probability <= 1):
+                raise ValueError("period_late_inquiry.probability must be between 0 and 1")
+            normalized_rule.update(
+                start_day=start_day,
+                probability=float(probability),
+                cooldown_days=cooldown_days,
+                observation_window_days=observation_window_days,
+            )
+        elif rule_id == "wellness_low_state":
+            mode = rule["mode"]
+            if not isinstance(mode, str) or mode not in {"unconfirmed", "numeric", "slow_down_category"}:
+                raise ValueError("wellness_low_state.mode is unsupported")
+            if not isinstance(rule["timezone_confirmed"], bool):
+                raise ValueError("wellness_low_state.timezone_confirmed must be boolean")
+            weekly_target = rule["weekly_target"]
+            if isinstance(weekly_target, bool) or not isinstance(weekly_target, int) or not 1 <= weekly_target <= 7:
+                raise ValueError("wellness_low_state.weekly_target must be between 1 and 7")
+            nullable_ranges = {
+                "low_score_threshold": (0, 999),
+                "recovery_score_threshold": (0, 999),
+                "confirmation_minutes": (1, 1440),
+                "minimum_independent_samples": (2, 100),
+                "recovery_debounce_minutes": (1, 1440),
+                "maximum_sample_age_minutes": (1, 1440),
+                "repeat_cooldown_minutes": (1, 10080),
+            }
+            for name, (minimum, maximum) in nullable_ranges.items():
+                value = rule[name]
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int)
+                    or not minimum <= value <= maximum
+                ):
+                    raise ValueError(f"wellness_low_state.{name} is outside its supported range")
+            if mode == "numeric":
+                low, recovery = rule["low_score_threshold"], rule["recovery_score_threshold"]
+                if low is not None and recovery is not None and recovery <= low:
+                    raise ValueError("wellness recovery threshold must exceed the low threshold")
+            for name in nullable_ranges:
+                normalized_rule[name] = rule[name]
+            required_common = (
+                "confirmation_minutes", "minimum_independent_samples",
+                "recovery_debounce_minutes", "maximum_sample_age_minutes",
+                "repeat_cooldown_minutes",
+            )
+            configured = (
+                mode in {"numeric", "slow_down_category"}
+                and rule["timezone_confirmed"] is True
+                and all(rule[name] is not None for name in required_common)
+                and (mode != "numeric" or (
+                    rule["low_score_threshold"] is not None
+                    and rule["recovery_score_threshold"] is not None
+                ))
+            )
+            if rule["enabled"] and not configured:
+                raise ValueError(
+                    "wellness_low_state cannot be enabled until its mode, timezone, and thresholds are confirmed"
+                )
+            normalized_rule.update(
+                mode=mode,
+                timezone_confirmed=rule["timezone_confirmed"],
+                weekly_target=weekly_target,
+            )
         normalized["rules"][rule_id] = normalized_rule
 
     return normalized
@@ -278,6 +413,11 @@ def build_preview_plan(
                 row.update(state="invalid_source", reason="预测日期无效")
                 plans.append(row)
                 continue
+            fact_lead_days = fact.get("lead_days", rule["lead_days"])
+            if isinstance(fact_lead_days, bool) or not isinstance(fact_lead_days, int) or not 1 <= fact_lead_days <= 14:
+                row.update(state="invalid_source", reason="预测阶段天数无效")
+                plans.append(row)
+                continue
         elif rule_id in {"confirmed_period_start", "confirmed_period_end"}:
             if fact.get("confirmed") is not True:
                 row.update(
@@ -291,7 +431,100 @@ def build_preview_plan(
                 row.update(state="invalid_source", reason="确认事件时间无效")
                 plans.append(row)
                 continue
-            freshness_at = occurred_at
+            stage = fact.get("stage")
+            if rule_id == "confirmed_period_start" and stage is not None:
+                stage_date = _parse_date(fact.get("target_date"))
+                source_start_date = occurred_at.astimezone(local_zone).date()
+                if (isinstance(stage, bool) or not isinstance(stage, int) or not 1 <= stage <= 3
+                        or stage_date != source_start_date + timedelta(days=stage - 1)
+                        or stage_date != now.astimezone(local_zone).date()):
+                    row.update(state="invalid_source", reason="经期阶段日期与明确开始事件不一致")
+                    plans.append(row)
+                    continue
+                freshness_at = observed_at
+            else:
+                freshness_at = occurred_at
+        elif rule_id in {"wellness_low_state", "sunlight_evening", "period_late_inquiry"}:
+            source_date = _parse_date(fact.get("data_date"))
+            candidate_at = _parse_aware_datetime(fact.get("candidate_at"))
+            candidate_end = _parse_aware_datetime(fact.get("candidate_window_end"))
+            expected_kind = {
+                "wellness_low_state": "sustained_low_state",
+                "sunlight_evening": "sunlight_opportunity",
+                "period_late_inquiry": "period_end_inquiry",
+            }[rule_id]
+            if fact.get("kind") != expected_kind or source_date is None:
+                row.update(state="invalid_source", reason="来源记录格式无效")
+                plans.append(row)
+                continue
+            if candidate_at is None or candidate_end is None or candidate_at > now or candidate_end <= candidate_at:
+                row.update(state="invalid_source", reason="随机候选时段无效或尚未到达")
+                plans.append(row)
+                continue
+            if candidate_at.astimezone(local_zone).date() != source_date:
+                row.update(state="invalid_source", reason="候选时段与数据日期不一致")
+                plans.append(row)
+                continue
+            if rule_id == "period_late_inquiry":
+                occurred_at = _parse_aware_datetime(fact.get("start_occurred_at"))
+                target_date = _parse_date(fact.get("target_date"))
+                period_day = fact.get("period_day")
+                ended = fact.get("ended")
+                actual_start_date = occurred_at.astimezone(local_zone).date() if occurred_at else None
+                if (fact.get("confirmed_start") is not True or occurred_at is None
+                        or occurred_at > now or target_date != source_date
+                        or target_date != now.astimezone(local_zone).date()
+                        or isinstance(period_day, bool) or not isinstance(period_day, int)
+                        or period_day < rule["start_day"]
+                        or period_day > rule["observation_window_days"]
+                        or actual_start_date is None
+                        or (target_date - actual_start_date).days + 1 != period_day):
+                    row.update(state="invalid_source", reason="需要观察窗内的明确经期开始事件")
+                    plans.append(row)
+                    continue
+                if ended is True:
+                    row.update(state="ended", reason="OPPO 已明确记录经期结束；后段询问立即停止")
+                    plans.append(row)
+                    continue
+                if fact.get("cancelled") is True:
+                    row.update(state="ended", reason="OPPO 已明确记录经期结束；未安排后段询问")
+                    plans.append(row)
+                    continue
+            freshness_at = observed_at
+            expected_at = candidate_at
+            end_at = candidate_end
+            basis = {
+                "wellness_low_state": "连续低状态来源样本",
+                "sunlight_evening": "当天明确日照记录",
+                "period_late_inquiry": "本人在 OPPO 明确记录的经期开始日之后的后段询问机会",
+            }[rule_id]
+            target_date = source_date
+            is_actual = True
+            if now > candidate_end:
+                row.update(state="stale_source", reason="已错过随机发送时段")
+                plans.append(row)
+                continue
+            age = now.astimezone(local_zone) - freshness_at.astimezone(local_zone)
+            if age > timedelta(hours=rule["stale_after_hours"]):
+                row.update(state="stale_source", reason="来源记录已过期")
+                plans.append(row)
+                continue
+            row.update(
+                state="preview_only",
+                reason=(
+                    "满足后段随机询问条件；最终仍由冷却、每日去重和隐私预检把关"
+                    if rule_id == "period_late_inquiry"
+                    else "满足候选条件；最终仍由隐私预检和去重状态把关"
+                ),
+                expected_at=expected_at.isoformat(),
+                expected_window_end=end_at.isoformat(),
+                basis=basis,
+                source_date=source_date.isoformat(),
+                target_date=target_date.isoformat(),
+                is_actual_event=is_actual,
+            )
+            plans.append(row)
+            continue
         else:
             source_date = _parse_date(fact.get("record_date"))
             if source_date is None:
@@ -302,18 +535,18 @@ def build_preview_plan(
                 row.update(state="invalid_source", reason="体重记录日期晚于当前日期")
                 plans.append(row)
                 continue
-            recorded_at = _parse_aware_datetime(fact.get("recorded_at"))
-            if fact.get("recorded_at") is not None and recorded_at is None:
-                row.update(state="invalid_source", reason="体重记录时间无效")
+            measured_at = _parse_aware_datetime(fact.get("measured_at"))
+            if measured_at is None:
+                row.update(state="invalid_source", reason="体重记录缺少实际测量日期和时刻")
                 plans.append(row)
                 continue
-            if recorded_at is not None and recorded_at.astimezone(local_zone).date() != source_date:
-                row.update(state="invalid_source", reason="体重记录时间与记录日期不一致")
+            if measured_at.astimezone(local_zone).date() != source_date:
+                row.update(state="invalid_source", reason="体重测量时刻与记录日期不一致")
                 plans.append(row)
                 continue
-            freshness_at = recorded_at or datetime.combine(source_date, time.min, tzinfo=local_zone)
+            freshness_at = measured_at
             if freshness_at > now:
-                row.update(state="invalid_source", reason="体重记录时间晚于当前时间")
+                row.update(state="invalid_source", reason="体重测量时刻晚于当前时间")
                 plans.append(row)
                 continue
         age = now.astimezone(local_zone) - freshness_at.astimezone(local_zone)
@@ -323,16 +556,16 @@ def build_preview_plan(
             continue
 
         if rule_id == "predicted_period_lead":
-            target_date = source_date - timedelta(days=rule["lead_days"])
+            target_date = source_date - timedelta(days=fact_lead_days)
             basis = "预测经期日期"
             is_actual = False
         elif rule_id in {"confirmed_period_start", "confirmed_period_end"}:
-            target_date = occurred_at.astimezone(ZoneInfo(rule["timezone"])).date()
-            basis = "明确确认的经期事件"
+            target_date = _parse_date(fact.get("target_date")) or occurred_at.astimezone(ZoneInfo(rule["timezone"])).date()
+            basis = f"明确开始事件第{fact['stage']}日" if rule_id == "confirmed_period_start" and fact.get("stage") else "明确确认的经期事件"
             is_actual = True
         else:
             target_date = source_date
-            basis = "体重记录日期"
+            basis = "减肥模式开启后的新体重测量日期"
             is_actual = True
 
         window_start = time.fromisoformat(rule["send_window"]["start"])

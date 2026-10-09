@@ -1,5 +1,6 @@
 """Private OPPO summaries, wake-up care and one optional daytime care."""
 import asyncio
+from copy import deepcopy
 import datetime as dt
 import inspect
 import json
@@ -17,20 +18,33 @@ from astrbot.core.message.components import Plain
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
 from .care_api import CarePageAPI
 from .care_logic import (
+    choose_sleep_care,
     due_kind,
     new_activity_due,
     observe_sleep_candidate,
     preflight_cooldown_active,
     preflight_sleep_record,
+    legacy_dispatch_skip_reason,
+    sleep_record,
     wake_due,
+    explicit_goodnight_message,
 )
-from .care_integration import enabled_capture_fields, facts_from_capture
+from .care_integration import enabled_capture_fields, event_key, facts_from_capture
 from .care_scheduler import (
     DispatchRejected,
     dispatch_due_async,
+    dispatch_window_skip_reason,
     pause_for_privacy,
 )
 from .care_store import CareRepository, CareStorageError
+from .care_wellness import (
+    explicit_weight_mode_command,
+    ensure_weekly_slots,
+    evaluate_capture as evaluate_wellness_capture,
+    sunlight_candidate,
+    weekly_candidate,
+    wellness_source_summary,
+)
 from .collector.storage import private_root, read_private_json, write_private_json
 from .local_request_policy import (
     format_local_health_context,
@@ -93,6 +107,7 @@ class OPPOHealth(Star):
         self._care_page_api = None
         self._care_facts = {}
         self._care_contexts = {}
+        self._pending_legacy_care = None
         self._care_dispatch_lock = asyncio.Lock()
         self._care_inflight_event_ids = set()
         self._care_consumed_event_ids = set()
@@ -321,10 +336,32 @@ class OPPOHealth(Star):
         try:
             config, _revision = self._care_repository.load_config()
             state = self._care_repository.load_scheduler_state()
+            wellness_state = self._care_repository.load_wellness_state()
         except CareStorageError:
             logger.warning('[oppo_health] 本机关怀规则状态无法安全读取；本轮保持暂停。')
             return
-        fields = enabled_capture_fields(config)
+        if self._goodnight_quiet_for_today(now):
+            reason = "本人已直接说晚安；本地日期剩余时间停止主动关怀"
+            self._pending_legacy_care = None
+            for job in state["jobs"].values():
+                if job.get("state") == "pending":
+                    job.update(state="skipped", reason=reason, updated_at=now.isoformat())
+                    state["attempts"].append({
+                        "job_id": job.get("event_key", ""),
+                        "rule_id": job.get("rule_id", ""),
+                        "at": now.isoformat(),
+                        "outcome": "skipped",
+                        "reason": reason,
+                    })
+                    del state["attempts"][:-5000]
+            self._care_repository.save_scheduler_state(state)
+            self._care_facts = {}
+            self._care_contexts.clear()
+            return
+        source_config = deepcopy(config)
+        if not wellness_state.get("weight_mode_enabled"):
+            source_config["rules"]["weight_date_linked"]["enabled"] = False
+        fields = enabled_capture_fields(source_config)
         if not fields:
             self._care_facts = {}
             self._care_contexts.clear()
@@ -382,9 +419,80 @@ class OPPOHealth(Star):
             except (OSError, asyncio.TimeoutError):
                 capture = None
         try:
-            facts, contexts, source_statuses = facts_from_capture(capture, config, now)
+            facts, contexts, source_statuses = facts_from_capture(
+                capture,
+                source_config,
+                now,
+                weight_mode_enabled_at=wellness_state.get("weight_mode_enabled_at")
+                if wellness_state.get("weight_mode_enabled") else None,
+            )
         except (TypeError, ValueError, KeyError):
             facts, contexts, source_statuses = {}, {}, []
+        wellness_rule = config["rules"]["wellness_low_state"]
+        if wellness_rule["enabled"]:
+            wellness_state = self._care_repository.load_wellness_state()
+            source_row = wellness_source_summary(capture, wellness_rule["timezone"], now)
+            wellness_state, evaluation, sample = evaluate_wellness_capture(
+                capture, wellness_rule, wellness_state, now
+            )
+            source_row.update(
+                evaluation_state=evaluation["status"],
+                reason=evaluation["reason"],
+            )
+            if evaluation.get("data_date"):
+                paused_for_source = evaluation["status"] == "paused_source"
+                stale_reasons = {
+                    "cross_day_data", "future_update_time", "future_source_time",
+                    "stale_source_sample", "out_of_order_source_sample",
+                }
+                source_row.update(
+                    data_date=evaluation["data_date"],
+                    measured_at=evaluation.get("measured_at"),
+                    observed_at=evaluation.get("observed_at"),
+                    category=evaluation.get("category"),
+                    quality=evaluation.get("quality"),
+                    completeness=evaluation.get("completeness"),
+                    status=(
+                        "stale" if evaluation.get("reason_code") in stale_reasons
+                        else ("unavailable" if paused_for_source else "ok")
+                    ),
+                    is_stale=evaluation.get("reason_code") in stale_reasons,
+                )
+            if evaluation["status"] not in {
+                "disabled", "parameters_unconfirmed", "timezone_unconfirmed",
+                "invalid_settings", "invalid_timezone",
+            }:
+                wellness_state = ensure_weekly_slots(wellness_state, now, wellness_rule)
+                wellness_state, fact, slot_reason = weekly_candidate(
+                    wellness_state, sample, evaluation, wellness_rule, now
+                )
+                if fact is not None:
+                    source_row["reason"] = slot_reason
+                    facts["wellness_low_state"] = [fact]
+                    contexts[event_key("wellness_low_state", fact["event_id"])] = (
+                        "本人连续的独立状态测量满足已设置的持续偏低条件。"
+                        "请以温柔、不评判的方式关心本人，帮助放松和舒缓情绪；不要提分值、不要把设备状态等同真实心情、不要诊断。"
+                    )
+                elif evaluation["status"] == "paused_source":
+                    source_row["reason"] = evaluation["reason"]
+                else:
+                    source_row["reason"] = slot_reason
+            self._care_repository.save_wellness_state(wellness_state)
+            source_statuses.append(source_row)
+        sunlight_rule = config["rules"]["sunlight_evening"]
+        if sunlight_rule["enabled"]:
+            wellness_state = self._care_repository.load_wellness_state()
+            wellness_state, fact, source_row = sunlight_candidate(
+                capture, sunlight_rule, wellness_state, now
+            )
+            if fact is not None:
+                facts["sunlight_evening"] = [fact]
+                contexts[event_key("sunlight_evening", fact["event_id"])] = (
+                    "本人 OPPO 健康记录明确显示今天日照记录在 0–5 分钟范围内。"
+                    "请自然、温柔地问候；不责备、不诊断，也不把缺失记录说成零。"
+                )
+            self._care_repository.save_wellness_state(wellness_state)
+            source_statuses.append(source_row)
         del capture
         self._care_facts = facts
         self._care_contexts = contexts
@@ -404,63 +512,105 @@ class OPPOHealth(Star):
         )
         try:
             state, _results = await dispatch_due_async(
-                config,
+                source_config,
                 facts,
                 state,
                 now,
                 self,
                 persist=self._care_repository.save_scheduler_state,
+                not_before=self._activated_at,
             )
             self._care_repository.save_scheduler_state(state)
         except CareStorageError:
             logger.warning('[oppo_health] 本机关怀调度状态无法安全保存；本轮保持暂停。')
 
     async def submit_scheduled_care(self, plan):
-        """Submit one metadata-only plan through AstrBot's existing private handler."""
+        """Submit one plan through the merged, private health-care ingress."""
+        return await self.submit_scheduled_care_batch([plan])
+
+    async def dispatch_batch(self, plans):
+        """Merge simultaneous scheduled reasons into one private handoff."""
+        return await self.submit_scheduled_care_batch(plans)
+
+    async def submit_scheduled_care_batch(self, plans):
+        """Validate, preflight, and hand off metadata-only care plans."""
         required = {
             "rule_id", "event_id", "target_at", "source_ref", "tone", "target_date",
             "basis", "is_actual_event", "timezone",
         }
-        if not isinstance(plan, dict) or set(plan) != required:
+        pending_legacy = self._pending_legacy_care
+        if not isinstance(plans, list) or len(plans) > 12 or (not plans and pending_legacy is None):
             raise DispatchRejected("dispatch_rejected")
-        rule_id = plan.get("rule_id")
-        event_id = plan.get("event_id")
-        if rule_id not in {"predicted_period_lead", "confirmed_period_start", "confirmed_period_end", "weight_date_linked"}:
+        allowed_rule_ids = {
+            "predicted_period_lead", "confirmed_period_start", "confirmed_period_end",
+            "period_late_inquiry",
+            "weight_date_linked", "wellness_low_state", "sunlight_evening",
+        }
+        event_ids = []
+        for plan in plans:
+            if not isinstance(plan, dict) or set(plan) != required:
+                raise DispatchRejected("dispatch_rejected")
+            if plan.get("rule_id") not in allowed_rule_ids:
+                raise DispatchRejected("dispatch_rejected")
+            event_id = plan.get("event_id")
+            if not isinstance(event_id, str) or len(event_id) != 64 or any(c not in "0123456789abcdef" for c in event_id):
+                raise DispatchRejected("dispatch_rejected")
+            event_ids.append(event_id)
+        if len(set(event_ids)) != len(event_ids):
             raise DispatchRejected("dispatch_rejected")
-        if not isinstance(event_id, str) or len(event_id) != 64 or any(c not in "0123456789abcdef" for c in event_id):
-            raise DispatchRejected("dispatch_rejected")
+        if self._goodnight_quiet_for_today(dt.datetime.now(TZ)):
+            if plans:
+                raise DispatchRejected("goodnight_quiet")
+            self._pending_legacy_care = None
+            return {
+                "outcome": "skipped",
+                "reason": "本人已直接说晚安；本地日期剩余时间停止主动关怀",
+            }
         async with self._care_dispatch_lock:
-            if event_id in self._care_consumed_event_ids or event_id in self._care_inflight_event_ids:
+            if any(event_id in self._care_consumed_event_ids or event_id in self._care_inflight_event_ids for event_id in event_ids):
                 raise DispatchRejected("event_consumed")
-            self._care_inflight_event_ids.add(event_id)
+            self._care_inflight_event_ids.update(event_ids)
         token = None
         try:
             if self._care_repository is None:
                 raise DispatchRejected("source_context_unavailable")
             config, _revision = self._care_repository.load_config()
-            rule = config["rules"].get(rule_id)
-            if not isinstance(rule, dict) or rule.get("enabled") is not True:
-                raise DispatchRejected("rule_disabled")
-            now = dt.datetime.now(ZoneInfo(rule["timezone"]))
-            try:
-                target_at = dt.datetime.fromisoformat(str(plan.get("target_at", "")).replace("Z", "+00:00"))
-            except ValueError:
-                raise DispatchRejected("event_not_due")
-            if target_at.tzinfo is None or target_at.utcoffset() is None or target_at > now:
-                raise DispatchRejected("event_not_due")
+            rules = []
+            for plan in plans:
+                rule_id = plan["rule_id"]
+                rule = config["rules"].get(rule_id)
+                if not isinstance(rule, dict) or rule.get("enabled") is not True:
+                    raise DispatchRejected("rule_disabled")
+                now = dt.datetime.now(ZoneInfo(rule["timezone"]))
+                try:
+                    target_at = dt.datetime.fromisoformat(str(plan.get("target_at", "")).replace("Z", "+00:00"))
+                except ValueError:
+                    raise DispatchRejected("event_not_due")
+                if target_at.tzinfo is None or target_at.utcoffset() is None or target_at > now:
+                    raise DispatchRejected("event_not_due")
+                rules.append(rule)
             state = self._care_repository.load_scheduler_state()
-            job = state["jobs"].get(event_id)
-            if (
-                not isinstance(job, dict)
-                or job.get("rule_id") != rule_id
-                or job.get("state") != "dispatching"
-                or job.get("expected_at") != plan.get("target_at")
-                or plan.get("source_ref") != "oppo_health_local_page"
-                or plan.get("tone") != rule.get("tone")
-                or plan.get("target_date") != job.get("target_date")
-                or plan.get("timezone") != job.get("timezone")
-            ):
-                raise DispatchRejected("event_consumed")
+            dispatch_windows = []
+            for plan, rule in zip(plans, rules):
+                event_id = plan["event_id"]
+                job = state["jobs"].get(event_id)
+                if (
+                    not isinstance(job, dict)
+                    or job.get("rule_id") != plan["rule_id"]
+                    or job.get("state") != "dispatching"
+                    or job.get("expected_at") != plan.get("target_at")
+                    or plan.get("source_ref") != "oppo_health_local_page"
+                    or plan.get("tone") != rule.get("tone")
+                    or plan.get("target_date") != job.get("target_date")
+                    or plan.get("timezone") != job.get("timezone")
+                ):
+                    raise DispatchRejected("event_consumed")
+                dispatch_windows.append((rule, job))
+            skip_reason = self._submission_window_skip_reason(
+                dispatch_windows, pending_legacy, dt.datetime.now(TZ),
+            )
+            if skip_reason is not None:
+                return {"outcome": "skipped", "reason": skip_reason}
             parts = self.umo.rsplit(':', 2)
             if (
                 len(parts) != 3 or parts[1] != 'FriendMessage' or not parts[2].isdigit()
@@ -469,48 +619,95 @@ class OPPOHealth(Star):
             ):
                 raise DispatchRejected("private_session_unavailable")
             await self._care_privacy_preflight()
-            care_context = self._care_contexts.get(event_id)
-            if not isinstance(care_context, str) or not care_context:
+            contexts = [self._care_contexts.get(event_id) for event_id in event_ids]
+            if any(not isinstance(care_context, str) or not care_context for care_context in contexts):
                 raise DispatchRejected("source_context_unavailable")
             platform = self.context.get_platform_inst(parts[0])
             bot = getattr(platform, 'bot', None)
             handler = getattr(bot, '_handle_event', None) or getattr(bot, 'handle_event', None)
             if not callable(handler):
                 raise DispatchRejected("handler_unavailable")
-            from aiocqhttp import Event
-            token = uuid.uuid4().hex
-            prompt = f"[OPPO每日关怀 token={token}] 请依据已核验的本人记录，用温和、不诊断的语气简短关心。"
-            event = Event.from_payload({
-                'post_type': 'message',
-                'message_type': 'private',
-                'sub_type': 'friend',
-                'message_id': time.time_ns() % 2147483647,
-                'user_id': int(parts[2]),
-                'self_id': int(self.config['bot_qq_id']),
-                'time': int(time.time()),
-                'message': [{'type': 'text', 'data': {'text': prompt}}],
-                'raw_message': prompt,
-                'font': 0,
-                'sender': {'user_id': int(parts[2]), 'nickname': '健康关怀'},
-            })
-            if event is None:
-                raise DispatchRejected("handler_unavailable")
+            if pending_legacy is not None:
+                contexts.append(pending_legacy["context"])
+            care_context = "\n\n".join(contexts)
+            if pending_legacy is not None:
+                token = pending_legacy["token"]
+                event = pending_legacy["event"]
+            else:
+                from aiocqhttp import Event
+                token = uuid.uuid4().hex
+                prompt = f"[OPPO每日关怀 token={token}] 请依据已核验的本人记录，用温和、不诊断的语气简短关心。"
+                event = Event.from_payload({
+                    'post_type': 'message',
+                    'message_type': 'private',
+                    'sub_type': 'friend',
+                    'message_id': time.time_ns() % 2147483647,
+                    'user_id': int(parts[2]),
+                    'self_id': int(self.config['bot_qq_id']),
+                    'time': int(time.time()),
+                    'message': [{'type': 'text', 'data': {'text': prompt}}],
+                    'raw_message': prompt,
+                    'font': 0,
+                    'sender': {'user_id': int(parts[2]), 'nickname': '健康关怀'},
+                })
+                if event is None:
+                    raise DispatchRejected("handler_unavailable")
+            skip_reason = self._submission_window_skip_reason(
+                dispatch_windows, pending_legacy, dt.datetime.now(TZ),
+            )
+            if skip_reason is not None:
+                return {"outcome": "skipped", "reason": skip_reason}
             self._pending_care_contexts[token] = care_context
-            self._care_consumed_event_ids.add(event_id)
-            await handler(event)
+            self._care_consumed_event_ids.update(event_ids)
+            return await handler(event)
         finally:
             if token is not None:
                 self._pending_care_contexts.pop(token, None)
-            self._care_contexts.pop(event_id, None)
-            self._care_inflight_event_ids.discard(event_id)
+            for event_id in event_ids:
+                self._care_contexts.pop(event_id, None)
+                self._care_inflight_event_ids.discard(event_id)
+            if pending_legacy is not None and self._pending_legacy_care is pending_legacy:
+                self._pending_legacy_care = None
 
     async def dispatch(self, plan):
         """Scheduler adapter that forwards only to the plugin-owned care ingress."""
         return await self.submit_scheduled_care(plan)
+
+    async def _flush_pending_legacy_care(self):
+        """Submit sleep/activity context after same-tick rule jobs can be merged."""
+        if self._pending_legacy_care is None:
+            return
+        try:
+            outcome = await self.submit_scheduled_care_batch([])
+        except DispatchRejected as exc:
+            logger.info('[oppo_health] 原有关怀未提交：安全入口状态为 %s。', exc.code)
+        else:
+            if isinstance(outcome, dict) and outcome.get('outcome') == 'skipped':
+                logger.info('[oppo_health] 原有关怀未提交：%s。', outcome.get('reason', '当前规则不满足'))
     async def _allowed(self, event):
         if not self.umo or ':FriendMessage:' not in self.umo or event.unified_msg_origin != self.umo:
             return False
         return await SessionPluginManager.is_plugin_enabled_for_session(self.umo, NAME)
+
+    def _apply_weight_mode_command(self, command):
+        """Persist a direct opt-in/out without reading or sending health data."""
+        if self._care_repository is None or command not in {"activate", "deactivate"}:
+            return False
+        try:
+            config, revision = self._care_repository.load_config()
+            runtime = self._care_repository.load_wellness_state()
+            enabled = command == "activate"
+            config["rules"]["weight_date_linked"]["enabled"] = enabled
+            self._care_repository.save_config(config, revision)
+            runtime["weight_mode_enabled"] = enabled
+            runtime["weight_mode_enabled_at"] = (
+                dt.datetime.now(dt.timezone.utc).isoformat() if enabled else None
+            )
+            self._care_repository.save_wellness_state(runtime)
+            return True
+        except (CareStorageError, ValueError, TypeError):
+            logger.warning('[oppo_health] Weight-care mode change could not be saved; mode stays fail-closed.')
+            return False
     @_on_waiting_llm_request()
     async def mark_local_health_request_intent(self, event: AstrMessageEvent):
         """Mark plain-text health intents before request hooks see history."""
@@ -686,6 +883,31 @@ class OPPOHealth(Star):
         self._last_user_activity = dt.datetime.now(TZ)
         message_obj = getattr(event, 'message_obj', None)
         components = getattr(message_obj, 'message', None)
+        own_plain_private = False
+        parts = self.umo.rsplit(':', 2)
+        if bool(components) and all(isinstance(component, Plain) for component in components) and len(parts) == 3:
+            sender_id = None
+            try:
+                sender_id = event.get_sender_id()
+            except Exception:
+                sender = getattr(message_obj, 'sender', None)
+                sender_id = getattr(sender, 'user_id', None)
+            own_plain_private = str(sender_id) == parts[2]
+        weight_command = explicit_weight_mode_command(
+            text, own_private_plain_message=own_plain_private
+        )
+        if weight_command is not None:
+            self._apply_weight_mode_command(weight_command)
+            return
+        if explicit_goodnight_message(text, own_private_plain_message=own_plain_private):
+            try:
+                now = dt.datetime.now(TZ)
+                state = self._state(now, self._cache)
+                state['goodnight_date'] = now.date().isoformat()
+                self._save_state(state)
+            except (OSError, RuntimeError, ValueError):
+                logger.warning('[oppo_health] 晚安静默状态无法安全保存；本轮主动关怀保持暂停。')
+                self._last_goodnight_date = dt.datetime.now(TZ).date().isoformat()
         requested_local_fields = local_fields_for_query(text)
         health_words_in_query = any(word in text for word in HEALTH_WORDS)
         if (
@@ -788,13 +1010,51 @@ class OPPOHealth(Star):
                 raise RuntimeError('Daily health care state is unreadable')
         state = {'date': now.date().isoformat(),
                  'activity_due': new_activity_due(now, wake_due(snapshot, now))}
-        for key in ('sleep_attempted_record_id', 'sleep_attempted_at'):
+        for key in (
+            'sleep_attempted_record_id', 'sleep_attempted_at', 'sleep_plan_record_id',
+            'sleep_care_selected', 'sleep_care_due_at', 'sleep_care_delay_minutes',
+        ):
             if previous.get(key):
                 state[key] = previous[key]
         self._save_state(state)
         return state
     def _save_state(self, state):
         write_private_json(state, self.state_path)
+
+    def _goodnight_quiet_for_today(self, now):
+        today = now.astimezone(TZ).date().isoformat()
+        if getattr(self, '_last_goodnight_date', None) == today:
+            return True
+        if not self.state_path.exists():
+            return False
+        try:
+            state = read_private_json(self.state_path)
+        except (ValueError, OSError):
+            logger.warning('[oppo_health] 晚安静默状态无法安全读取；本轮主动关怀保持暂停。')
+            return True
+        return isinstance(state, dict) and state.get('goodnight_date') == today
+
+    def _submission_window_skip_reason(self, windows, pending_legacy, now):
+        if self._goodnight_quiet_for_today(now):
+            return "本人已直接说晚安；本地日期剩余时间停止主动关怀"
+        if pending_legacy is not None:
+            code = legacy_dispatch_skip_reason(
+                pending_legacy.get('kind'), pending_legacy.get('target_at'),
+                now, self._activated_at,
+            )
+            if code is not None:
+                return {
+                    'before_activation': '计划时间早于本次插件启用时刻，不补发历史关怀',
+                    'not_due': '关怀时间尚未到',
+                    'expired': '已错过本次关怀时段，不补发',
+                    'quiet_or_expired': '处于夜间静默或已错过关怀时段，已跳过',
+                }.get(code, '关怀时段无效，已跳过')
+        for rule, job in windows:
+            reason = dispatch_window_skip_reason(rule, job, now, self._activated_at)
+            if reason is not None:
+                return reason
+        return None
+
     async def _care(self, now):
         if not self.config.get('daily_care', False):
             return
@@ -817,6 +1077,14 @@ class OPPOHealth(Star):
         snapshot = self._cache
         state = self._state(now, snapshot)
         _, _, state_changed = observe_sleep_candidate(state, snapshot, now)
+        sleep_candidate = sleep_record(snapshot, now)
+        if sleep_candidate and state.get('sleep_plan_record_id') != sleep_candidate['record_id']:
+            plan = choose_sleep_care(sleep_candidate['record_id'], sleep_candidate['wake_at'])
+            state['sleep_plan_record_id'] = plan['record_id']
+            state['sleep_care_selected'] = plan['selected']
+            state['sleep_care_delay_minutes'] = plan['delay_minutes']
+            state['sleep_care_due_at'] = plan['due_at']
+            state_changed = True
         if state_changed:
             self._save_state(state)
         kind = due_kind(state, snapshot, now, self._activated_at, self._last_user_activity)
@@ -853,7 +1121,7 @@ class OPPOHealth(Star):
             now = preflight_now
 
         from aiocqhttp import Event
-        topic = ('用户手表记录的起床时间已过去约一小时，关心昨晚睡眠。'
+        topic = (f"用户手表记录的起床时间已过去约{state.get('sleep_care_delay_minutes', 60)}分钟，关心昨晚睡眠。"
                  if kind == 'sleep' else '这是今天随机安排的一次活动关怀，关心运动、久坐休息或最近一次心率。')
         care_token = uuid.uuid4().hex
         care_context = (
@@ -873,20 +1141,26 @@ class OPPOHealth(Star):
                                     'sender': {'user_id': uid, 'nickname': '每日健康关怀'}})
         if event is None:
             raise RuntimeError('Health care event could not be constructed')
-        # Reserve only after the private event is fully constructed, but
-        # before dispatch so a reload cannot duplicate a completed attempt.
         attempt_at = dt.datetime.now(TZ).isoformat()
         state[kind + '_attempted'] = True
         state[kind + '_attempted_at'] = attempt_at
         if kind == 'sleep':
             state['sleep_attempted_record_id'] = sleep_record_id
         self._save_state(state)
-        self._pending_care_contexts[care_token] = care_context
-        try:
-            await handler(event)
-        finally:
-            self._pending_care_contexts.pop(care_token, None)
-        logger.info('[oppo_health] %s 关怀已交给私聊回复流程。', kind)
+        if self._pending_legacy_care is not None:
+            logger.info('[oppo_health] 上一条原有关怀尚未处理；本轮新候选已跳过。')
+            return
+        reason_id = 'sleep_wake' if kind == 'sleep' else 'random_activity'
+        event_suffix = sleep_record_id if kind == 'sleep' else state['date']
+        self._pending_legacy_care = {
+            'kind': kind,
+            'reason_id': reason_id,
+            'dispatch_id': f'legacy-{kind}:{event_suffix}',
+            'token': care_token,
+            'target_at': state.get('sleep_care_due_at') if kind == 'sleep' else state.get('activity_due'),
+            'context': care_context,
+            'event': event,
+        }
     async def _worker(self):
         next_poll = 0
         next_rules_poll = 0
@@ -899,6 +1173,7 @@ class OPPOHealth(Star):
                 if time.monotonic() >= next_rules_poll:
                     await self._care_rules_tick(dt.datetime.now(TZ))
                     next_rules_poll = time.monotonic() + 900
+                await self._flush_pending_legacy_care()
             except asyncio.CancelledError:
                 raise
             except Exception:

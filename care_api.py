@@ -18,13 +18,28 @@ _RULE_NAMES = {
     "predicted_period_lead": "预测经期提前提醒",
     "confirmed_period_start": "已确认经期开始",
     "confirmed_period_end": "已确认经期结束",
+    "period_late_inquiry": "经期后段随机询问",
     "weight_date_linked": "体重按记录日期联动",
+    "wellness_low_state": "身心状态值持续偏低关怀",
+    "sunlight_evening": "日照记录关怀",
 }
 _SOURCE_NAMES = {
     "predicted_period": "经期预测",
     "confirmed_period_start": "经期开始确认",
     "confirmed_period_end": "经期结束确认",
+    "period_late_inquiry": "经期后段询问",
     "weight_entry": "体重记录",
+    "wellness_low_state": "身心状态值",
+    "sunlight_evening": "日照记录",
+}
+_RULE_SOURCES = {
+    "predicted_period_lead": "predicted_period",
+    "confirmed_period_start": "confirmed_period_start",
+    "confirmed_period_end": "confirmed_period_end",
+    "period_late_inquiry": "period_late_inquiry",
+    "weight_date_linked": "weight_entry",
+    "wellness_low_state": "wellness_low_state",
+    "sunlight_evening": "sunlight_evening",
 }
 
 
@@ -120,7 +135,7 @@ class CarePageAPI:
             fields["last_route_error_code"] = "preflight_unavailable"
         sources = []
         if isinstance(fields["data_sources"], list):
-            for item in fields["data_sources"][:4]:
+            for item in fields["data_sources"][:8]:
                 if not isinstance(item, dict):
                     continue
                 source = item.get("source")
@@ -140,6 +155,11 @@ class CarePageAPI:
                     "observed_at": observed_at if isinstance(observed_at, str) and len(observed_at) <= 64 else None,
                     "is_stale": item.get("is_stale") if isinstance(item.get("is_stale"), bool) else None,
                     "reason": reason if isinstance(reason, str) and len(reason) <= 160 else None,
+                    "measured_at": item.get("measured_at") if isinstance(item.get("measured_at"), str) and len(item["measured_at"]) <= 64 else None,
+                    "category": item.get("category") if isinstance(item.get("category"), str) and len(item["category"]) <= 32 else None,
+                    "quality": item.get("quality") if isinstance(item.get("quality"), str) and len(item["quality"]) <= 64 else None,
+                    "completeness": item.get("completeness") if isinstance(item.get("completeness"), str) and len(item["completeness"]) <= 200 else None,
+                    "evaluation_state": item.get("evaluation_state") if isinstance(item.get("evaluation_state"), str) and len(item["evaluation_state"]) <= 48 else None,
                 })
         fields["data_sources"] = sources
         if fields["source_observed_at"] is None:
@@ -159,15 +179,18 @@ class CarePageAPI:
         try:
             config, revision = self.repository.load_config()
             persisted = self.repository.load_scheduler_state()
+            runtime_policy = self.repository.load_wellness_state()
         except CareStorageError:
             return error_response("本机关怀配置无法安全读取", status_code=503)
 
         now = datetime.now(timezone.utc)
         plan = build_preview_plan(config, {}, now)
+        runtime_status = await self._status_snapshot()
         jobs_by_rule: dict[str, list[dict[str, Any]]] = {rule_id: [] for rule_id in RULE_IDS}
         for job in persisted["jobs"].values():
             if job.get("rule_id") in jobs_by_rule:
                 jobs_by_rule[job["rule_id"]].append(job)
+        sources_by_id = {item["source"]: item for item in runtime_status["data_sources"]}
         rules = []
         for item in plan["plans"]:
             jobs = jobs_by_rule[item["rule_id"]]
@@ -176,13 +199,38 @@ class CarePageAPI:
                 key=lambda job: str(job.get("expected_at", "")),
             )
             current_job = pending[0] if pending else (jobs[-1] if jobs else None)
+            source_status = sources_by_id.get(_RULE_SOURCES[item["rule_id"]], {})
+            evaluation_state = source_status.get("evaluation_state")
+            late_inquiry_status_override = (
+                item["rule_id"] == "period_late_inquiry"
+                and evaluation_state in {
+                    "unsupported", "unavailable", "paused_stale", "paused_window",
+                    "ended", "waiting_for_start", "waiting_for_late_phase",
+                    "not_selected", "missed_window",
+                }
+            )
+            if not item["enabled"]:
+                displayed_state = "disabled"
+                displayed_reason = item["reason"]
+            elif late_inquiry_status_override:
+                displayed_state = evaluation_state
+                displayed_reason = source_status.get("reason") or item["reason"]
+            elif current_job is not None:
+                displayed_state = current_job["state"]
+                displayed_reason = current_job.get("reason") or source_status.get("reason") or item["reason"]
+            else:
+                displayed_state = evaluation_state or source_status.get("status") or item["state"]
+                displayed_reason = source_status.get("reason") or item["reason"]
             rules.append({
                 "rule_id": item["rule_id"],
                 "name": _RULE_NAMES[item["rule_id"]],
                 "enabled": item["enabled"],
-                "state": current_job.get("state") if current_job else item["state"],
+                "state": displayed_state,
                 "expected_at": current_job.get("expected_at") if current_job and current_job.get("state") == "pending" else None,
-                "reason": current_job.get("reason") if current_job else item["reason"],
+                "reason": displayed_reason,
+                "checked_at": source_status.get("observed_at"),
+                "data_date": source_status.get("data_date"),
+                "measured_at": source_status.get("measured_at"),
             })
 
         daily_care = bool(self.plugin_config.get("daily_care", False))
@@ -197,8 +245,6 @@ class CarePageAPI:
             }
             for item in persisted["attempts"][-10:]
         ]
-        runtime_status = await self._status_snapshot()
-        sources_by_id = {item["source"]: item for item in runtime_status["data_sources"]}
         data_sources = [
             sources_by_id.get(source, {
                 "source": source,
@@ -224,14 +270,21 @@ class CarePageAPI:
                     "name": "睡眠关怀",
                     "enabled": daily_care,
                     "state": "enabled" if daily_care else "disabled",
-                    "reason": "沿用现有插件设置",
+                    "reason": "新睡眠记录按 50% 独立随机选择；选中后在实际醒来 60–120 分钟后检查；22:00–08:00 不打扰。旧睡眠/活动各自最多一次/日，合计最多两次",
                 },
                 {
                     "rule_id": "random_activity",
                     "name": "随机活动关怀",
                     "enabled": daily_care and bool(self.plugin_config.get("random_activity_care", True)),
                     "state": "enabled" if daily_care and bool(self.plugin_config.get("random_activity_care", True)) else "disabled",
-                    "reason": "受现有睡眠关怀总开关控制",
+                    "reason": "受旧睡眠关怀总开关控制；旧睡眠和活动各自最多一次/日，合计最多两次。新固定类别不计入此旧规则上限",
+                },
+                {
+                    "rule_id": "weight_mode",
+                    "name": "本人减肥模式",
+                    "enabled": runtime_policy.get("weight_mode_enabled") is True,
+                    "state": "enabled" if runtime_policy.get("weight_mode_enabled") is True else "disabled",
+                    "reason": "只由本人私聊明确说“我想减肥/我要减肥”开启；“我不减肥”关闭；仅处理开启后实际测量的新记录",
                 },
             ],
             "data_sources": data_sources,
@@ -244,9 +297,9 @@ class CarePageAPI:
             },
             "privacy_status": runtime_status,
             "notice": (
-                "新规则仅在本机来源、runner 和当前模型授权预检均通过后运行。"
+                "类别规则不共用每日次数或最短间隔；各自按页面参数、来源和安全预检运行。主动查询不占主动关怀次数。"
                 if runtime_status["health_context_to_model_enabled"]
-                else "新规则当前处于暂停状态；本机安全预检未全部通过，不会读取新来源或提交关怀。"
+                else "新规则当前处于暂停状态；本机安全预检未全部通过，不会读取新来源或提交关怀。主动查询不计入主动关怀次数。"
             ),
         })
 

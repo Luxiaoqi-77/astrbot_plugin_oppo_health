@@ -1,8 +1,7 @@
 """Side-effect-free rule reconciliation and an adapter-injected dispatch core.
 
 This module deliberately has no AstrBot, health-source, model, QQ, or network
-imports. Production must provide an explicit source adapter and sender before
-any scheduling is enabled; the plugin candidate currently wires neither.
+imports. The plugin supplies an explicit source adapter and private sender.
 """
 
 from __future__ import annotations
@@ -22,10 +21,14 @@ _SOURCE_BY_RULE = {
     "predicted_period_lead": "predicted_period",
     "confirmed_period_start": "confirmed_period_start",
     "confirmed_period_end": "confirmed_period_end",
+    "period_late_inquiry": "period_late_inquiry",
     "weight_date_linked": "weight_entry",
+    "wellness_low_state": "wellness_low_state",
+    "sunlight_evening": "sunlight_evening",
 }
 _LIVE_JOB_STATES = {"pending", "paused_stale", "paused_source_missing", "paused_invalid", "paused_privacy"}
 _COUNTED_ATTEMPTS = {"dispatching", "handed_off", "failed", "failed_uncertain"}
+_JOB_HISTORY_RETENTION = timedelta(days=180)
 _TERMINAL_JOB_STATES = {
     "handed_off", "failed", "failed_uncertain", "skipped", "cancelled"
 }
@@ -43,7 +46,7 @@ class DispatchRejected(RuntimeError):
         self.code = code if code in {
             "rule_disabled", "event_not_due", "event_consumed", "private_session_unavailable",
             "privacy_preflight_unavailable", "runner_unsupported", "provider_unapproved",
-            "source_context_unavailable", "handler_unavailable",
+            "source_context_unavailable", "handler_unavailable", "goodnight_quiet",
         } else "dispatch_rejected"
         super().__init__(self.code)
 
@@ -58,6 +61,7 @@ _REJECT_REASONS = {
     "provider_unapproved": "当前模型服务未获本机健康数据授权，已暂停提交",
     "source_context_unavailable": "来源记录已不可用，未提交关怀",
     "handler_unavailable": "AstrBot 私聊回复入口不可用",
+    "goodnight_quiet": "本人已直接说晚安；本地日期剩余时间停止主动关怀",
     "dispatch_rejected": "关怀入口拒绝了本次提交",
 }
 
@@ -70,6 +74,52 @@ def _parse_aware(value: object) -> datetime | None:
     except ValueError:
         return None
     return result if result.tzinfo is not None and result.utcoffset() is not None else None
+
+
+def dispatch_window_skip_reason(
+    rule: dict[str, Any], job: dict[str, Any], now: datetime,
+    not_before: datetime | None = None,
+) -> str | None:
+    """Return a safe skip reason when a pending job is old, quiet, or expired."""
+    expected_at = _parse_aware(job.get("expected_at"))
+    window_end = _parse_aware(job.get("window_end"))
+    if (expected_at is None or window_end is None or now.tzinfo is None
+            or now.utcoffset() is None):
+        return "排定时段无效；已跳过"
+    if not_before is not None:
+        if not_before.tzinfo is None or not_before.utcoffset() is None:
+            return "插件启用时间无效；已跳过"
+        if expected_at < not_before:
+            return "计划时间早于本次插件启用时刻，不补发历史关怀"
+    if expected_at > now:
+        return "提醒时间尚未到"
+    if now >= window_end:
+        return "已错过本次发送时段，不补发"
+    zone = ZoneInfo(rule["timezone"])
+    local_now = now.astimezone(zone)
+    local_minute = local_now.hour * 60 + local_now.minute
+    send_start = time.fromisoformat(rule["send_window"]["start"])
+    send_end = time.fromisoformat(rule["send_window"]["end"])
+    send_start_minute = send_start.hour * 60 + send_start.minute
+    send_end_minute = send_end.hour * 60 + send_end.minute
+    expected_local = expected_at.astimezone(zone)
+    expected_minute = expected_local.hour * 60 + expected_local.minute
+    if not send_start_minute <= expected_minute < send_end_minute:
+        return "计划时间不在当前规则发送时段内，跳过本次关怀"
+    if not send_start_minute <= local_minute < send_end_minute:
+        return "已超出当前规则发送时段，跳过本次关怀"
+    quiet_start = time.fromisoformat(rule["quiet_hours"]["start"])
+    quiet_end = time.fromisoformat(rule["quiet_hours"]["end"])
+    start_minute = quiet_start.hour * 60 + quiet_start.minute
+    end_minute = quiet_end.hour * 60 + quiet_end.minute
+    in_quiet = (
+        start_minute <= local_minute < end_minute
+        if start_minute < end_minute
+        else local_minute >= start_minute or local_minute < end_minute
+    )
+    if in_quiet:
+        return "处于免打扰时段，已跳过本次关怀"
+    return None
 
 
 def _event_key(rule_id: str, stable_event_id: str) -> str:
@@ -90,6 +140,36 @@ def _append_attempt(state: dict[str, Any], attempt: dict[str, Any]) -> None:
     del attempts[:-5000]
 
 
+def _filter_ineligible_due_jobs(
+    state: dict[str, Any],
+    due_jobs: list[tuple[str, dict[str, Any]]],
+    config: dict[str, Any],
+    now: datetime,
+    not_before: datetime | None,
+    persist: Callable[[dict[str, Any]], None] | None,
+) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, str]]]:
+    eligible = []
+    skipped = []
+    for job_id, job in due_jobs:
+        rule = config["rules"][job["rule_id"]]
+        reason = dispatch_window_skip_reason(rule, job, now, not_before)
+        if reason is None:
+            eligible.append((job_id, job))
+            continue
+        job.update(state="skipped", reason=reason, updated_at=now.isoformat())
+        _append_attempt(state, {
+            "job_id": job_id,
+            "rule_id": job["rule_id"],
+            "at": now.isoformat(),
+            "outcome": "skipped",
+            "reason": reason,
+        })
+        skipped.append({"job_id": job_id, "outcome": "skipped", "reason": reason})
+        if persist is not None:
+            persist(deepcopy(state))
+    return eligible, skipped
+
+
 def _pause_rule_jobs(state: dict[str, Any], rule_id: str, status: str, reason: str) -> None:
     for job in state["jobs"].values():
         if job.get("rule_id") == rule_id and job.get("state") in _LIVE_JOB_STATES:
@@ -106,6 +186,8 @@ def reconcile_jobs(
     event_facts: object,
     current_state: object,
     now: datetime,
+    *,
+    not_before: datetime | None = None,
 ) -> dict[str, Any]:
     """Reconcile explicit source facts into durable pending jobs.
 
@@ -117,6 +199,8 @@ def reconcile_jobs(
     validated = validate_config(config)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
+    if not_before is not None and (not_before.tzinfo is None or not_before.utcoffset() is None):
+        raise ValueError("not_before must be timezone-aware")
     if current_state is None or current_state == {}:
         state = empty_scheduler_state()
     elif not isinstance(current_state, dict):
@@ -127,6 +211,7 @@ def reconcile_jobs(
             or not isinstance(state.get("attempts"), list)):
         raise ValueError("scheduler state is invalid")
     facts = event_facts if isinstance(event_facts, dict) else {}
+    current_event_keys: set[str] = set()
 
     for rule_id in RULE_IDS:
         rule = validated["rules"][rule_id]
@@ -147,10 +232,16 @@ def reconcile_jobs(
                 continue
             event_key = _event_key(rule_id, stable_id.strip())
             seen_event_keys.add(event_key)
+            current_event_keys.add(event_key)
             job = state["jobs"].get(event_key)
             if fact.get("cancelled") is True:
                 if job is not None and job.get("state") in _LIVE_JOB_STATES:
-                    job.update(state="cancelled", reason="来源明确取消了这条记录", updated_at=now.isoformat())
+                    reason = (
+                        "OPPO 已明确记录经期结束；后段询问已取消"
+                        if rule_id == "period_late_inquiry"
+                        else "来源明确取消了这条记录"
+                    )
+                    job.update(state="cancelled", reason=reason, updated_at=now.isoformat())
                 continue
 
             plan = _plan_for_fact(validated, rule_id, fact, now)
@@ -172,24 +263,12 @@ def reconcile_jobs(
             next_state = "pending"
             reason = "等待可发送时段"
             now_local = now.astimezone(ZoneInfo(rule["timezone"]))
-            if now_local >= window_end:
-                if rule["reschedule"] == "skip_if_late":
-                    next_state = "skipped"
-                    reason = "已错过发送时段，按设置跳过"
-                else:
-                    next_date = max(expected_at.date() + timedelta(days=1), now_local.date())
-                    end_time = time.fromisoformat(rule["send_window"]["end"])
-                    if next_date == now_local.date() and now_local.timetz().replace(tzinfo=None) >= end_time:
-                        next_date += timedelta(days=1)
-                    expected_at = datetime.combine(
-                        next_date, time.fromisoformat(rule["send_window"]["start"]),
-                        tzinfo=ZoneInfo(rule["timezone"]),
-                    )
-                    window_end = datetime.combine(
-                        next_date, time.fromisoformat(rule["send_window"]["end"]),
-                        tzinfo=ZoneInfo(rule["timezone"]),
-                    )
-                    reason = "已错过原时段，顺延到下一个可发送时段"
+            if not_before is not None and expected_at < not_before:
+                next_state = "skipped"
+                reason = "计划时间早于本次插件启用时刻，不补发历史关怀"
+            elif now_local >= window_end:
+                next_state = "skipped"
+                reason = "已错过发送时段；历史关怀不补发"
 
             values = {
                 "event_key": event_key,
@@ -224,6 +303,18 @@ def reconcile_jobs(
         # pause them until a source explicitly confirms their state.
         if not seen_event_keys:
             _pause_rule_jobs(state, rule_id, "paused_source_missing", "来源未提供可识别的事件")
+
+    # The longest configurable cycle observation window is 60 days. Keep
+    # expired event tombstones for three times that span, while bounding the
+    # private scheduler file. Facts still present in the current source retain
+    # their tombstone so repeated polls cannot recreate an already handled job.
+    history_cutoff = now - _JOB_HISTORY_RETENTION
+    for job_id, job in list(state["jobs"].items()):
+        if job_id in current_event_keys or job.get("state") == "dispatching":
+            continue
+        window_end = _parse_aware(job.get("window_end"))
+        if window_end is not None and window_end <= history_cutoff:
+            del state["jobs"][job_id]
 
     return state
 
@@ -263,6 +354,23 @@ def _local_day(value: datetime, timezone_name: str) -> date:
 def _is_duplicate(
     state: dict[str, Any], job: dict[str, Any], rule: dict[str, Any], now: datetime
 ) -> str | None:
+    # Sustained-state repeats use distinct verified samples plus the explicit
+    # wellness repeat cooldown. A generic duplicate window would add an
+    # undocumented second spacing policy to this category.
+    if job.get("rule_id") == "wellness_low_state":
+        return None
+    if job.get("rule_id") == "period_late_inquiry":
+        cooldown_seconds = rule["cooldown_days"] * 24 * 60 * 60
+        for attempt in reversed(state["attempts"]):
+            if attempt.get("rule_id") != "period_late_inquiry" or attempt.get("outcome") not in _COUNTED_ATTEMPTS:
+                continue
+            attempted_at = _parse_aware(attempt.get("at"))
+            if attempted_at is None:
+                continue
+            elapsed = (now - attempted_at).total_seconds()
+            if elapsed < cooldown_seconds:
+                return f"处于经期后段询问的 {rule['cooldown_days']} 天冷却期"
+        return None
     zone = rule["timezone"]
     local_day = _local_day(now, zone)
     for attempt in reversed(state["attempts"]):
@@ -299,6 +407,7 @@ def dispatch_due(
     sender: DispatchAdapter,
     *,
     persist: Callable[[dict[str, Any]], None] | None = None,
+    not_before: datetime | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Run due jobs via an explicitly injected adapter and persist reservation first.
 
@@ -309,7 +418,7 @@ def dispatch_due(
     """
     validated = validate_config(config)
     state = recover_interrupted_attempts(current_state, now)
-    state = reconcile_jobs(validated, event_facts, state, now)
+    state = reconcile_jobs(validated, event_facts, state, now, not_before=not_before)
     results: list[dict[str, str]] = []
     if persist is not None:
         persist(deepcopy(state))
@@ -323,6 +432,10 @@ def dispatch_due(
         ),
         key=lambda pair: pair[1]["expected_at"],
     )
+    due_jobs, skipped = _filter_ineligible_due_jobs(
+        state, due_jobs, validated, now, not_before, persist
+    )
+    results.extend(skipped)
     for job_id, job in due_jobs:
         rule = validated["rules"][job["rule_id"]]
         if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
@@ -393,6 +506,7 @@ async def dispatch_due_async(
     sender: DispatchAdapter,
     *,
     persist: Callable[[dict[str, Any]], None] | None = None,
+    not_before: datetime | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Async counterpart used by the plugin-owned safe care ingress.
 
@@ -401,7 +515,7 @@ async def dispatch_due_async(
     """
     validated = validate_config(config)
     state = recover_interrupted_attempts(current_state, now)
-    state = reconcile_jobs(validated, event_facts, state, now)
+    state = reconcile_jobs(validated, event_facts, state, now, not_before=not_before)
     results: list[dict[str, str]] = []
     if persist is not None:
         persist(deepcopy(state))
@@ -415,6 +529,85 @@ async def dispatch_due_async(
         ),
         key=lambda pair: pair[1]["expected_at"],
     )
+    due_jobs, skipped = _filter_ineligible_due_jobs(
+        state, due_jobs, validated, now, not_before, persist
+    )
+    results.extend(skipped)
+    batch_dispatch = getattr(sender, "dispatch_batch", None)
+    if callable(batch_dispatch) and due_jobs:
+        eligible: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for job_id, job in due_jobs:
+            rule = validated["rules"][job["rule_id"]]
+            reason = None
+            if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
+                reason = "已达到这条规则的每日提醒上限"
+            else:
+                reason = _is_duplicate(state, job, rule, now)
+            if reason:
+                job.update(state="skipped", reason=reason, updated_at=now.isoformat())
+                attempt = {
+                    "job_id": job_id, "rule_id": job["rule_id"], "at": now.isoformat(),
+                    "outcome": "skipped", "reason": reason,
+                }
+                _append_attempt(state, attempt)
+                results.append({"job_id": job_id, "outcome": "skipped", "reason": reason})
+                if persist is not None:
+                    persist(deepcopy(state))
+                continue
+            eligible.append((job_id, job, rule))
+
+        if eligible:
+            plans = []
+            attempts_by_job = {}
+            for job_id, job, rule in eligible:
+                job.update(state="dispatching", reason="已并入本人私聊关怀", updated_at=now.isoformat())
+                attempt = {
+                    "job_id": job_id, "rule_id": job["rule_id"], "at": now.isoformat(),
+                    "outcome": "dispatching", "reason": "本人私聊回复流程调用中",
+                }
+                _append_attempt(state, attempt)
+                attempts_by_job[job_id] = attempt
+                plans.append({
+                    "rule_id": job["rule_id"],
+                    "event_id": job_id,
+                    "target_at": job.get("expected_at"),
+                    "source_ref": "oppo_health_local_page",
+                    "tone": rule["tone"],
+                    "target_date": job.get("target_date"),
+                    "basis": job.get("basis"),
+                    "is_actual_event": job.get("is_actual_event") is True,
+                    "timezone": job.get("timezone"),
+                })
+            if persist is not None:
+                persist(deepcopy(state))
+            try:
+                outcome = batch_dispatch(plans)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+            except DispatchRejected as exc:
+                outcome_name = "skipped" if exc.code == "goodnight_quiet" else "failed"
+                reason = _REJECT_REASONS.get(exc.code, _REJECT_REASONS["dispatch_rejected"])
+            except Exception as exc:
+                outcome_name = "failed"
+                reason = f"本人私聊回复流程未完成（{type(exc).__name__}）"
+            else:
+                if isinstance(outcome, dict) and outcome.get("outcome") == "skipped":
+                    outcome_name = "skipped"
+                    reason = outcome.get("reason") if isinstance(outcome.get("reason"), str) else "这轮关怀已跳过"
+                elif isinstance(outcome, dict) and outcome.get("outcome") == "failed":
+                    outcome_name = "failed"
+                    reason = "本人私聊回复流程拒绝了合并关怀"
+                else:
+                    outcome_name = "handed_off"
+                    reason = "合并关怀已交给 AstrBot 私聊回复流程；平台送达状态未确认"
+            for job_id, job, _rule in eligible:
+                job.update(state=outcome_name, reason=reason, updated_at=now.isoformat())
+                attempts_by_job[job_id].update(outcome=outcome_name, reason=reason)
+                results.append({"job_id": job_id, "outcome": outcome_name, "reason": reason})
+            if persist is not None:
+                persist(deepcopy(state))
+        return state, results
+
     for job_id, job in due_jobs:
         rule = validated["rules"][job["rule_id"]]
         if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
@@ -467,7 +660,7 @@ async def dispatch_due_async(
             if inspect.isawaitable(outcome):
                 outcome = await outcome
         except DispatchRejected as exc:
-            outcome_name = "failed"
+            outcome_name = "skipped" if exc.code == "goodnight_quiet" else "failed"
             reason = _REJECT_REASONS.get(exc.code, _REJECT_REASONS["dispatch_rejected"])
         except Exception as exc:  # Do not persist exception text or request contents.
             outcome_name = "failed"

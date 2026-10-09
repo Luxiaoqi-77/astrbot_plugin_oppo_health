@@ -50,6 +50,19 @@ class FakeEvent:
         self.stopped = True
 
 
+def _fixed_main_datetime(main):
+    base = main.dt.datetime
+
+    class FixedDateTime(base):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls(2031, 11, 16, 15, 0)
+            return cls(2031, 11, 16, 15, 0, tzinfo=main.TZ).astimezone(tz)
+
+    return FixedDateTime
+
+
 def _identity_decorator(*_args, **_kwargs):
     return lambda function: function
 
@@ -78,11 +91,15 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         collector.__path__ = [str(root / "collector")]
         care = _module(
             "oppo_health_candidate.care_logic",
+            choose_sleep_care=lambda *_args: {"record_id": "synthetic", "selected": False, "delay_minutes": 90, "due_at": None},
             due_kind=lambda *_args: None,
+            explicit_goodnight_message=lambda *_args, **_kwargs: False,
+            legacy_dispatch_skip_reason=lambda *_args: None,
             new_activity_due=lambda *_args: None,
             observe_sleep_candidate=lambda *_args: (None, False, False),
             preflight_cooldown_active=lambda *_args: False,
             preflight_sleep_record=lambda *_args: None,
+            sleep_record=lambda *_args: None,
             wake_due=lambda *_args: None,
         )
         storage = _module(
@@ -173,6 +190,14 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         }
         self.plugin = self.main.OPPOHealth(object(), config)
         return session
+
+    def _enable_weight_mode(self, enabled_at):
+        runtime = self.plugin._care_repository.load_wellness_state()
+        runtime.update(
+            weight_mode_enabled=True,
+            weight_mode_enabled_at=enabled_at,
+        )
+        self.plugin._care_repository.save_wellness_state(runtime)
 
     async def test_default_config_disables_local_pages_and_keeps_public_collector_defaults(self):
         schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
@@ -281,6 +306,10 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         self._install_core_privacy_helpers()
         session = self._new_plugin(enabled=False)
         self.plugin.config.update(daily_care=True, bot_qq_id="9876")
+        self.plugin._care_repository = self.main.CareRepository(Path(self.temp_dir.name) / "care")
+        self.plugin._care_privacy_preflight = AsyncMock(return_value={
+            "health_context_to_model_enabled": True,
+        })
         self.plugin.health_ai_core_api = object()
         self.plugin.approved_provider_hosts = ("approved.example",)
         self.plugin._cache = {"date": "2031-11-15", "metrics": {}}
@@ -317,6 +346,7 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         with patch.object(self.main, "due_kind", return_value="sleep"):
                             await self.plugin._care(now)
+                            await self.plugin._flush_pending_legacy_care()
         finally:
             if previous is None:
                 sys.modules.pop("aiocqhttp", None)
@@ -580,6 +610,7 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         config, revision = self.plugin._care_repository.load_config()
         config["rules"]["weight_date_linked"]["enabled"] = True
         self.plugin._care_repository.save_config(config, revision)
+        self._enable_weight_mode(dt.datetime.now(dt.timezone.utc).isoformat())
         api.preflight_local_health_care = Mock(return_value={"supported_runner": True})
         self.plugin._run = AsyncMock(side_effect=AssertionError("preflight must fail closed"))
 
@@ -602,6 +633,7 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         config, revision = self.plugin._care_repository.load_config()
         config["rules"]["weight_date_linked"]["enabled"] = True
         self.plugin._care_repository.save_config(config, revision)
+        self._enable_weight_mode("2031-11-15T00:00:00+00:00")
         del api.preflight_local_health_care
         self.plugin._run = AsyncMock(side_effect=AssertionError("source capture must remain closed"))
 
@@ -615,6 +647,41 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["last_route_error_code"], "preflight_unavailable")
         self.assertEqual(self.plugin._pending_care_contexts, {})
 
+    async def test_goodnight_skips_pending_new_jobs_and_clears_legacy_candidate(self):
+        self._new_plugin(enabled=True)
+        self.plugin._care_repository = self.main.CareRepository(Path(self.temp_dir.name) / "care")
+        config, revision = self.plugin._care_repository.load_config()
+        config["rules"]["confirmed_period_start"]["enabled"] = True
+        self.plugin._care_repository.save_config(config, revision)
+        now = self.main.dt.datetime(2031, 11, 16, 8, 0, tzinfo=self.main.TZ)
+        event_id = "d" * 64
+        state = {
+            "schema_version": 1,
+            "jobs": {event_id: {
+                "event_key": event_id, "rule_id": "confirmed_period_start",
+                "target_date": now.date().isoformat(), "basis": "synthetic event",
+                "expected_at": (now - self.main.dt.timedelta(minutes=1)).isoformat(),
+                "window_end": (now + self.main.dt.timedelta(minutes=15)).isoformat(),
+                "timezone": "Asia/Shanghai", "source_observed_at": now.isoformat(),
+                "is_actual_event": True, "state": "pending", "reason": "test",
+                "updated_at": now.isoformat(), "created_at": now.isoformat(),
+            }},
+            "attempts": [],
+        }
+        self.plugin._care_repository.save_scheduler_state(state)
+        self.plugin._pending_legacy_care = {"kind": "activity", "context": "synthetic"}
+        self.plugin._run = AsyncMock(side_effect=AssertionError("goodnight must stop before capture"))
+        self.plugin._goodnight_quiet_for_today = Mock(return_value=True)
+
+        await self.plugin._care_rules_tick(now)
+
+        self.plugin._run.assert_not_awaited()
+        self.assertIsNone(self.plugin._pending_legacy_care)
+        persisted = self.plugin._care_repository.load_scheduler_state()
+        self.assertEqual(persisted["jobs"][event_id]["state"], "skipped")
+        self.assertEqual(persisted["attempts"][-1]["outcome"], "skipped")
+        self.assertIn("晚安", persisted["attempts"][-1]["reason"])
+
     async def test_scheduled_ingress_requires_dispatching_job_and_one_use_event(self):
         api = self._install_core_privacy_helpers()
         session = self._new_plugin(enabled=True)
@@ -623,9 +690,12 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         rule = config["rules"]["weight_date_linked"]
         rule["enabled"] = True
         self.plugin._care_repository.save_config(config, revision)
+        self._enable_weight_mode("2031-11-15T00:00:00+00:00")
         event_id = "a" * 64
-        current = self.main.dt.datetime.now(self.main.TZ)
+        frozen_datetime = _fixed_main_datetime(self.main)
+        current = frozen_datetime.now(self.main.TZ)
         target_at = (current - self.main.dt.timedelta(minutes=2)).isoformat()
+        self.plugin._activated_at = current - self.main.dt.timedelta(minutes=5)
         target_date = self.main.dt.datetime.fromisoformat(target_at).date().isoformat()
         state = {"schema_version": 1, "jobs": {}, "attempts": []}
         state["jobs"][event_id] = {
@@ -683,9 +753,11 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
             "is_actual_event": True, "timezone": "Asia/Shanghai",
         }
         try:
-            await self.plugin.submit_scheduled_care(plan)
-            with self.assertRaises(self.main.DispatchRejected):
-                await self.plugin.submit_scheduled_care(plan)
+            with patch.object(self.main.dt, "datetime", frozen_datetime):
+                first_outcome = await self.plugin.submit_scheduled_care(plan)
+                self.assertIn(event_id, self.plugin._care_consumed_event_ids, first_outcome)
+                with self.assertRaises(self.main.DispatchRejected):
+                    await self.plugin.submit_scheduled_care(plan)
         finally:
             if previous is None:
                 sys.modules.pop("aiocqhttp", None)
@@ -721,6 +793,12 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
             "last_route_error_code": None,
         })
         now = self.main.dt.datetime.now(self.main.TZ)
+        self.plugin._activated_at = now - self.main.dt.timedelta(days=1)
+        self._enable_weight_mode(
+            (now - self.main.dt.timedelta(minutes=5)).astimezone(
+                self.main.dt.timezone.utc
+            ).isoformat()
+        )
         record_date = now.date().isoformat()
         capture = {
             "status": "ok",
@@ -732,9 +810,8 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
                         "observed_at": now.isoformat(),
                         "metrics": {"weight_history_records": [{
                             "record_date": record_date,
-                            "measured_at_local": "07:45",
+                            "measured_at_local": now.strftime("%H:%M"),
                             "observed_at": now.isoformat(),
-                            "recorded_at": None,
                             "value": 61.7,
                             "unit": "kg",
                         }]},
@@ -791,6 +868,111 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("平台送达状态未确认", persisted["attempts"][-1]["reason"])
         self.assertNotIn("61.7", json.dumps(persisted, ensure_ascii=False))
 
+    async def test_merged_rules_use_one_private_handoff_without_global_daily_cap(self):
+        self._install_core_privacy_helpers()
+        session = self._new_plugin(enabled=True)
+        directory = Path(self.temp_dir.name) / "care"
+        self.plugin._care_repository = self.main.CareRepository(directory)
+        config, revision = self.plugin._care_repository.load_config()
+        config["rules"]["confirmed_period_start"]["enabled"] = True
+        config["rules"]["confirmed_period_end"]["enabled"] = True
+        config["rules"]["weight_date_linked"]["enabled"] = True
+        self.plugin._care_repository.save_config(config, revision)
+        frozen_datetime = _fixed_main_datetime(self.main)
+        now = frozen_datetime.now(self.main.TZ)
+        self.plugin._activated_at = now - self.main.dt.timedelta(minutes=5)
+        target = (now - self.main.dt.timedelta(minutes=1)).isoformat()
+        first_id, second_id, third_id = "a" * 64, "b" * 64, "c" * 64
+        scheduler_state = self.plugin._care_repository.load_scheduler_state()
+
+        def add_job(event_id, rule_id):
+            rule = config["rules"][rule_id]
+            scheduler_state["jobs"][event_id] = {
+                "event_key": event_id,
+                "rule_id": rule_id,
+                "target_date": now.date().isoformat(),
+                "basis": "synthetic source reason",
+                "expected_at": target,
+                "window_end": (now + self.main.dt.timedelta(minutes=15)).isoformat(),
+                "timezone": "Asia/Shanghai",
+                "source_observed_at": now.isoformat(),
+                "is_actual_event": True,
+                "state": "dispatching",
+                "reason": "test only",
+                "updated_at": now.isoformat(),
+                "created_at": now.isoformat(),
+            }
+            self.plugin._care_contexts[event_id] = f"Synthetic safe context for {rule_id}."
+            return {
+                "rule_id": rule_id,
+                "event_id": event_id,
+                "target_at": target,
+                "source_ref": "oppo_health_local_page",
+                "tone": rule["tone"],
+                "target_date": now.date().isoformat(),
+                "basis": "synthetic source reason",
+                "is_actual_event": True,
+                "timezone": "Asia/Shanghai",
+            }
+
+        plans = [
+            add_job(first_id, "confirmed_period_start"),
+            add_job(second_id, "confirmed_period_end"),
+        ]
+        self.plugin._pending_legacy_care = {
+            "kind": "sleep",
+            "reason_id": "sleep_wake",
+            "dispatch_id": "legacy-sleep:synthetic-record",
+            "token": "legacy-token",
+            "target_at": target,
+            "context": "Synthetic safe context for the existing sleep check-in.",
+            "event": FakeEvent("[OPPO每日关怀 token=legacy-token] synthetic sleep care", session),
+        }
+        self.plugin._care_repository.save_scheduler_state(scheduler_state)
+        api = self._install_core_privacy_helpers()
+        self.plugin._care_privacy_preflight = AsyncMock(return_value={
+            "health_context_to_model_enabled": True,
+        })
+        observed = []
+
+        async def handle(event):
+            observed.append((event, dict(self.plugin._pending_care_contexts)))
+
+        self.plugin.context = types.SimpleNamespace(
+            get_platform_inst=Mock(return_value=types.SimpleNamespace(
+                bot=types.SimpleNamespace(_handle_event=handle)
+            ))
+        )
+
+        class SyntheticCQEvent:
+            @staticmethod
+            def from_payload(payload):
+                return FakeEvent(payload["message"][0]["data"]["text"], session)
+
+        cq_module = types.ModuleType("aiocqhttp")
+        cq_module.Event = SyntheticCQEvent
+        previous = sys.modules.get("aiocqhttp")
+        sys.modules["aiocqhttp"] = cq_module
+        try:
+            with patch.object(self.main.dt, "datetime", frozen_datetime):
+                await self.plugin.submit_scheduled_care_batch(plans)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(len(observed[0][1]), 1)
+                merged_context = next(iter(observed[0][1].values()))
+                self.assertIn("confirmed_period_start", merged_context)
+                self.assertIn("confirmed_period_end", merged_context)
+                self.assertIn("existing sleep check-in", merged_context)
+
+                third_plan = add_job(third_id, "weight_date_linked")
+                self.plugin._care_repository.save_scheduler_state(scheduler_state)
+                await self.plugin.submit_scheduled_care_batch([third_plan])
+                self.assertEqual(len(observed), 2)
+        finally:
+            if previous is None:
+                sys.modules.pop("aiocqhttp", None)
+            else:
+                sys.modules["aiocqhttp"] = previous
+
     async def test_care_worker_uses_tokenized_safe_ingress_and_cleans_pending_context(self):
         api = self._install_core_privacy_helpers()
         session = self._new_plugin(enabled=True)
@@ -801,6 +983,7 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
             "metrics": {"steps": {"total": 42}},
         }
         self.plugin.config.update(daily_care=True, random_activity_care=True)
+        self.plugin._care_repository = self.main.CareRepository(Path(self.temp_dir.name) / "care")
         self.plugin._cache = snapshot
         self.plugin._activated_at = now
         self.plugin._last_user_activity = None
@@ -840,6 +1023,7 @@ class PluginEntryTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(self.main, "due_kind", return_value="activity"):
                 await self.plugin._care(now)
+                await self.plugin._flush_pending_legacy_care()
         finally:
             if previous is None:
                 sys.modules.pop("aiocqhttp", None)

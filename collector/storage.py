@@ -86,6 +86,8 @@ def write_private_json(value, path):
     try:
         with os.fdopen(fd, 'wb') as out:
             out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
         os.replace(temp, path)
     finally:
         if temp.exists():
