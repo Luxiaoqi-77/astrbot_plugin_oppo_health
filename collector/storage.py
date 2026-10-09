@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 
 FORMAT = 'oppo-health-dpapi-v1'
@@ -80,7 +81,7 @@ def write_private_json(value, path):
         raise ValueError('私有目录不能为符号链接')
     if not is_windows():
         path.parent.chmod(0o700)
-    temp = path.with_name('.private-' + os.urandom(8).hex())
+    temp = path.with_name('.private-' + secrets.token_hex(8))
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, 'wb') as out:

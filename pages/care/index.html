@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>健康关怀设置</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">OPPO 健康 · 本机设置</p>
+          <h1>关怀设置</h1>
+          <p class="intro">查看现有开关、数据状态和关怀规则。新规则需要你确认后才会启用。</p>
+        </div>
+        <div id="connection-status" class="demo-pill" role="status">
+          <span class="demo-dot" aria-hidden="true"></span>
+          正在连接 AstrBot…
+        </div>
+      </header>
+
+      <section class="demo-notice" aria-label="功能状态说明">
+        <strong id="runtime-state-title">正在读取本机运行状态</strong>
+        <span id="runtime-state-description">新规则只会在来源、内部回复路径和当前模型授权预检都通过后运行。</span>
+      </section>
+
+      <section class="summary-grid" aria-label="关怀概况">
+        <article class="summary-card">
+          <span class="summary-label">已开启的新规则</span>
+          <strong id="enabled-count" class="summary-value">— / 4</strong>
+          <span class="summary-hint">新规则默认关闭</span>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">预计提醒</span>
+          <strong id="next-preview" class="summary-value summary-value-small">尚无来源记录</strong>
+          <span class="summary-hint">预览不会发送消息</span>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">模型授权</span>
+          <strong class="summary-value summary-value-small">跟随当前对话</strong>
+          <span class="summary-hint" id="host-status">授权状态暂不可用</span>
+        </article>
+      </section>
+
+      <section class="section-block" aria-labelledby="data-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">数据状态</p>
+            <h2 id="data-title">规则需要的数据</h2>
+          </div>
+          <span id="evaluated-at" class="section-aside">尚未读取</span>
+        </div>
+        <div class="data-grid" id="data-grid" aria-live="polite"></div>
+        <p class="subtle-note">页面只显示来源日期和是否过期，不显示体重等数值。来源未接入时不会虚构日期。</p>
+      </section>
+
+      <section class="section-block" aria-labelledby="existing-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">已有功能</p>
+            <h2 id="existing-title">原有每日关怀</h2>
+          </div>
+          <span class="section-aside">沿用插件现有设置</span>
+        </div>
+        <div class="data-grid" id="existing-care-grid"></div>
+        <p class="subtle-note">这里仅查看当前开关，不修改睡眠关怀和活动关怀的原有行为。</p>
+      </section>
+
+      <section class="section-block" aria-labelledby="rules-title">
+        <div class="section-heading rules-heading">
+          <div>
+            <p class="eyebrow">规则配置</p>
+            <h2 id="rules-title">以后可以添加的关怀</h2>
+          </div>
+          <button class="button button-secondary" id="preview-button" type="button" disabled>预览安排</button>
+        </div>
+        <div class="rule-list" id="rule-list"></div>
+        <div id="preview-message" class="inline-message" role="status" hidden></div>
+        <div class="form-actions">
+          <span id="save-message" class="save-message" role="status">正在读取已保存设置…</span>
+          <button class="button button-primary" id="save-button" type="button" disabled>保存设置</button>
+        </div>
+      </section>
+
+      <section class="section-block" aria-labelledby="history-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">执行记录</p>
+            <h2 id="history-title">最近关怀状态</h2>
+          </div>
+          <span class="demo-tag">只显示状态</span>
+        </div>
+        <div class="history-list" id="history-list"></div>
+        <p class="subtle-note">“已交给流程”表示 AstrBot 已接收私聊事件，不等于平台确认送达。</p>
+      </section>
+
+      <footer class="page-footer">
+        <span>页面数据保存在 AstrBot 本机插件目录</span>
+        <span>不做医学诊断 · 体重提醒语气温和、不评判</span>
+      </footer>
+      <div id="page-error" class="error-message" role="alert" hidden></div>
+    </main>
+    <script src="./care.js" defer></script>
+  </body>
+</html>

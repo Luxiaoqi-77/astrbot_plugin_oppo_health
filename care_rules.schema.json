@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OPPO Health Care Rules",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "rules"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "predicted_period_lead",
+        "confirmed_period_start",
+        "confirmed_period_end",
+        "weight_date_linked"
+      ],
+      "properties": {
+        "predicted_period_lead": { "$ref": "#/$defs/periodLeadRule" },
+        "confirmed_period_start": { "$ref": "#/$defs/rule" },
+        "confirmed_period_end": { "$ref": "#/$defs/rule" },
+        "weight_date_linked": { "$ref": "#/$defs/rule" }
+      }
+    }
+  },
+  "$defs": {
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" },
+        "end": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" }
+      }
+    },
+    "commonFields": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "timezone": { "type": "string", "default": "Asia/Shanghai" },
+        "send_window": { "$ref": "#/$defs/window", "default": { "start": "09:00", "end": "21:00" } },
+        "max_per_day": { "type": "integer", "minimum": 1, "maximum": 5, "default": 1 },
+        "duplicate_window_minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "default": 30 },
+        "quiet_hours": { "$ref": "#/$defs/window", "default": { "start": "22:00", "end": "08:00" } },
+        "tone": { "enum": ["gentle", "brief"], "default": "gentle" },
+        "stale_after_hours": { "type": "integer", "minimum": 1, "maximum": 336, "default": 48 },
+        "deduplication": { "enum": ["per_event", "per_local_date"], "default": "per_event" },
+        "reschedule": { "enum": ["next_allowed_window", "skip_if_late"], "default": "next_allowed_window" }
+      }
+    },
+    "rule": {
+      "allOf": [
+        { "$ref": "#/$defs/commonFields" },
+        {
+          "type": "object",
+          "required": [
+            "enabled", "timezone", "send_window", "max_per_day", "quiet_hours",
+            "duplicate_window_minutes",
+            "tone", "stale_after_hours", "deduplication", "reschedule"
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "periodLeadRule": {
+      "allOf": [
+        { "$ref": "#/$defs/commonFields" },
+        {
+          "type": "object",
+          "required": [
+            "enabled", "timezone", "send_window", "max_per_day", "quiet_hours",
+            "duplicate_window_minutes",
+            "tone", "stale_after_hours", "deduplication", "reschedule", "lead_days"
+          ],
+          "properties": { "lead_days": { "type": "integer", "minimum": 1, "maximum": 14, "default": 3 } }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

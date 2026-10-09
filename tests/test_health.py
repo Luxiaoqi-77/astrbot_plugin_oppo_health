@@ -4,12 +4,22 @@ from zoneinfo import ZoneInfo
 from unittest.mock import patch
 from snapshot import summarize, collect
 from cloud_client import day_range, fetch
-from care_logic import wake_due, due_kind, new_activity_due
+from care_logic import (
+    due_kind,
+    new_activity_due,
+    observe_sleep_candidate,
+    wake_due,
+)
 
 TZ=ZoneInfo('Asia/Shanghai')
 DAY=dt.date(2026,10,7)
 def at(hour,minute=0): return dt.datetime(2026,10,7,hour,minute,tzinfo=TZ)
-def ms(hour): return int(at(hour).timestamp()*1000)
+def ms(hour, minute=0): return int(at(hour, minute).timestamp()*1000)
+
+def sleep_snapshot(fetched_at):
+ r=dict(date=20261007,totalSleepTime=450,modifiedTimestamp=ms(8,30),sleepMainData=dict(totalSleepTime=405,sleepInTime=ms(0),sleepOutTime=ms(8)))
+ sleep=summarize('sleep',[r],DAY)
+ return dict(date=DAY.isoformat(),fetched_at=fetched_at.isoformat(),metrics={'sleep':sleep})
 
 class HealthTests(unittest.TestCase):
  def test_steps_deduplicate_and_hide(self):
@@ -20,10 +30,12 @@ class HealthTests(unittest.TestCase):
   rows=[dict(dataCreatedTimestamp=ms(8),heartRateValue=70,heartRateType=0),dict(dataCreatedTimestamp=ms(9),heartRateValue=190,heartRateType=5),dict(dataCreatedTimestamp=ms(10),heartRateValue=200,heartRateType=0,display=0)]
   self.assertEqual(summarize('heart_rate',rows,DAY)['latest'],70)
  def test_sleep_main_and_day(self):
-  r=dict(date=20261007,totalSleepTime=450,modifiedTimestamp=2,sleepMainData=dict(totalSleepTime=405,sleepInTime=ms(0),sleepOutTime=ms(8)))
+  r=dict(date=20261007,totalSleepTime=450,modifiedTimestamp=ms(8,30),sleepMainData=dict(totalSleepTime=405,sleepInTime=ms(0),sleepOutTime=ms(8)))
   s=summarize('sleep',[r,dict(r,date=20261006,modifiedTimestamp=3)],DAY)
   self.assertEqual(s['minutes'],405)
-  snap=dict(date=DAY.isoformat(),metrics={'sleep':s})
+  self.assertEqual(s['record_date'],DAY.isoformat())
+  self.assertEqual(s['record_modified_at'],at(8,30).isoformat())
+  snap=dict(date=DAY.isoformat(),fetched_at=at(9,45).isoformat(),metrics={'sleep':s})
   self.assertEqual(wake_due(snap,at(10)),at(9))
  def test_missing_not_zero(self):
   self.assertIsNone(summarize('steps',[],DAY))
@@ -31,8 +43,11 @@ class HealthTests(unittest.TestCase):
    s=collect(DAY)
   self.assertFalse(s['metrics']); self.assertEqual(len(s['errors']),4)
  def test_sleep_due_once_and_restart(self):
-  s=dict(date=DAY.isoformat(),metrics={'sleep':{'wake_time':at(8).isoformat()}})
+  first=sleep_snapshot(at(8,40))
+  s=sleep_snapshot(at(8,56))
   state=dict(date=DAY.isoformat(),activity_due=at(15).isoformat())
+  observe_sleep_candidate(state,first,at(8,40))
+  observe_sleep_candidate(state,s,at(8,56))
   self.assertIsNone(due_kind(state,s,at(8,59),at(7)))
   self.assertEqual(due_kind(state,s,at(9),at(7)),'sleep')
   self.assertIsNone(due_kind(dict(state,sleep_attempted=True),s,at(9),at(7)))

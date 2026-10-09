@@ -66,7 +66,9 @@ def summarize(metric, rows, date):
         main = row.get('sleepMainData') or row
         return {'minutes': main.get('totalSleepTime', row['totalSleepTime']),
                 'bedtime': measured_at(main.get('sleepInTime')),
-                'wake_time': measured_at(main.get('sleepOutTime'))}
+                'wake_time': measured_at(main.get('sleepOutTime')),
+                'record_date': date.isoformat(),
+                'record_modified_at': measured_at(number(row.get('modifiedTimestamp')))}
     raise ValueError('Unsupported metric')
 
 
@@ -88,6 +90,9 @@ def collect(date=None):
             value = summarize(metric, result.get('records', []), date)
             if value is not None:
                 snapshot['metrics'][metric] = value
+    # Timestamp the completed fetch so scheduler freshness checks compare
+    # source-record modification time with the actual snapshot observation.
+    snapshot['fetched_at'] = dt.datetime.now(TZ).isoformat()
     return snapshot
 
 

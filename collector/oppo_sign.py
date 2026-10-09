@@ -71,8 +71,9 @@ def sign_headers(headers: dict, body: str = "") -> str:
     return base64.b64encode(hmac.new(derive_http_secret(), canonical.encode(), hashlib.sha256).digest()).decode()
 
 if __name__ == '__main__':
-    import json, os
-    samples = json.load(open(os.path.expanduser('~/oppo/oppo-health/cloud-mcp/sign_samples.json')))
+    import json
+    from pathlib import Path
+    samples = json.loads(Path(__file__).with_name("sign_samples.json").read_text(encoding="utf-8"))
     ok = sum(1 for s in samples if sign_headers(s['headers'], s.get('body','')) == s['signature'])
     print(f'对拍验证: {ok}/{len(samples)}')
     assert ok == len(samples), '签名复刻失败'

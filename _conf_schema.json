@@ -46,5 +46,20 @@
     "description": "凭证失效时尝试模拟器重新读取",
     "hint": "仅在完成 docs/EMULATOR_AUTH.md 的专用模拟器配置后开启。不保证永久续期。",
     "default": false
+  },
+  "enable_local_health_pages": {
+    "type": "bool",
+    "description": "按需读取本人本机健康页面",
+    "hint": "默认关闭；还需要显式批准的 provider host 与兼容的核心隐私 API。",
+    "default": false
+  },
+  "approved_provider_hosts": {
+    "type": "list",
+    "description": "仅供本人健康请求使用的 HTTPS provider host 白名单",
+    "hint": "默认空且关闭健康数据模型传输。请在本机逐项明确填写；当前主模型 host 必须在名单内，备用模型也只能使用名单中的 host。切换模型不会自动增加 host。",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   }
 }

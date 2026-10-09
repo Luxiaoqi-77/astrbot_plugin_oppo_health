@@ -1,1 +1,1 @@
-"""Bundled collector and private storage utilities."""
+"""Private storage helpers and local OPPO Health collection adapters."""
