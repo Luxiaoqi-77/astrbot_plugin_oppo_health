@@ -137,6 +137,34 @@ def health_query_mentions_known_metric(text: str) -> bool:
     )
 
 
+def explicit_owner_health_data_query(text: str) -> bool:
+    """Recognize an explicit request for health data belonging to the owner.
+
+    Args:
+        text: Combined user text after ordinary message batching.
+
+    Returns:
+        True only for a health metric query. If third-person language is also
+        present, the queried metric must be explicitly tied to the owner.
+    """
+    if not health_query_mentions_known_metric(text):
+        return False
+    if not re.search(
+        r"查询|查一下|查下|查看|看一下|看看|调取|读取|获取|告诉我|给我看|数据|记录|报告|统计|"
+        r"多少|多久|几小时|几分钟|几步|几公斤|怎么样|如何|好不好",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    if not health_query_mentions_other_person(text):
+        return True
+    return bool(re.search(
+        r"(?:我的|我自己的|本人(?:的)?)\s*(?:昨晚的?|今天的?|最近的?|睡眠|心率|血氧|步数|体重|健康|运动)",
+        text,
+        re.IGNORECASE,
+    ))
+
+
 def provider_host_is_approved(core_api: Any, configured_host: str) -> bool:
     """Require a configured HTTPS host to pass AstrBot's request host guard."""
     normalized = normalize_provider_host(configured_host)
@@ -237,7 +265,9 @@ def local_result_has_health_values(result: Any, requested_fields: list[str]) -> 
     return False
 
 
-def format_local_health_context(result: Any, requested_fields: list[str]) -> str:
+def format_local_health_context(
+    result: Any, requested_fields: list[str], *, now: datetime | None = None
+) -> str:
     """Format only requested page data and fail closed on malformed results."""
     lines = ["[本人 OPPO 健康本机页面读取，仅用于本次请求]"]
     pages = result.get("pages", {}) if isinstance(result, dict) else {}
@@ -248,15 +278,38 @@ def format_local_health_context(result: Any, requested_fields: list[str]) -> str
         "wellness_home": {"label", "kind", "score", "category", "point_time_local"},
         "wellness_detail": {"label", "kind", "category_label", "score", "category"},
         "active_calories": {"label", "unit", "active_kcal", "goal_kcal"},
-        "steps_daily_summary": {"label", "unit", "steps", "goal_steps"},
-        "steps_daily_details": {"label", "unit", "distance_km"},
+        # OCR daily aggregates have no latest-contributing-sample timestamp.
+        "steps_daily_summary": {"label", "unit", "goal_steps"},
+        "steps_daily_details": {"label", "unit"},
+    }
+    time_semantics = {
+        "cycle_calendar": "事件或预测日期，不是实时生理状态；observed_at 仅为本轮页面读取时间",
+        "weight_history": "按记录日期和测量时刻表达历史测量；observed_at 仅为本轮页面读取时间",
+        "sun_exposure": "按所选日期表达日累计；observed_at 是读取时间，不代表最后一次日照测量时间",
+        "wellness_home": "point_time_local 是样本时刻；observed_at 是本轮页面读取时间",
+        "wellness_detail": "所选日期的日均值，没有单样本时间，不得表述为当前状态",
+        "active_calories": "按所选日期表达累计值；observed_at 是读取时间，不代表最后一次活动时间",
+        "steps_daily_summary": "仅有日汇总日期，没有最新贡献样本时间；当前步数不可用",
+        "steps_daily_details": "没有距离样本时间；当前距离不可用",
+    }
+    current_day_fields = {
+        "sun_exposure", "wellness_home", "wellness_detail", "active_calories",
+        "steps_daily_summary", "steps_daily_details",
     }
     for field in requested_fields:
         page = pages.get(field) if isinstance(pages, dict) else None
-        if not isinstance(page, dict) or not isinstance(page.get("data"), dict):
+        if (not isinstance(page, dict) or page.get("status") != "ok"
+                or not isinstance(page.get("data"), dict)):
             lines.append(f"{field}: 本机页面暂不可用；不得推测数值。")
             continue
         data = page["data"]
+        if (
+            field in current_day_fields
+            and now is not None
+            and data.get("date") != now.date().isoformat()
+        ):
+            lines.append(f"{field}: 来源日期不是今天；不能作为当前数据使用。")
+            continue
         metrics = data.get("metrics")
         if not isinstance(metrics, dict):
             lines.append(f"{field}: 本机页面暂不可用；不得推测数值。")
@@ -269,17 +322,38 @@ def format_local_health_context(result: Any, requested_fields: list[str]) -> str
             for key in ("source", "page", "observed_at", "date", "period", "metrics")
             if key in data
         }
+        visible["time_semantics"] = time_semantics.get(
+            field, "observed_at 仅为本轮页面读取时间"
+        )
         visible["metrics"] = {
             key: value
             for key, value in metrics.items()
             if key in allowed_metrics.get(field, set())
         }
+        if field == "wellness_home":
+            point_time = visible["metrics"].get("point_time_local")
+            if not isinstance(point_time, str) or not re.fullmatch(
+                r"(?:[01]\d|2[0-3]):[0-5]\d", point_time
+            ):
+                for key in ("score", "category", "point_time_local"):
+                    visible["metrics"].pop(key, None)
+                visible["time_semantics"] = "缺少样本时刻；当前状态值不可用"
+        elif field == "weight_history":
+            records = visible["metrics"].get("weight_history_records")
+            if isinstance(records, list):
+                visible["metrics"]["weight_history_records"] = [
+                    row for row in records
+                    if isinstance(row, dict)
+                    and isinstance(row.get("record_date"), str)
+                    and isinstance(row.get("measured_at_local"), str)
+                    and re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", row["measured_at_local"])
+                ]
         lines.append(json.dumps(visible, ensure_ascii=False, separators=(",", ":")))
         if page.get("status") == "no_visible_value":
             lines.append(f"{field}: 页面读取成功，但未识别到该项数值；不得将缺失当作 0。")
     lines.append(
         "只回答用户所问且可见的项目。缺失字段按不可用处理，不推测。"
         "区分 Period 与 Predicted period；Mind and Body 使用页面原标签，不称为压力；"
-        "Active calories 不等同总卡路里。读取时间不是测量时间，不作诊断。"
+        "Active calories 不等同总卡路里。读取时间不是测量时间；没有可靠测量时间的字段不可称为当前值；不作诊断。"
     )
     return "\n".join(lines)

@@ -23,6 +23,12 @@
     "hint": "需先开启睡眠关怀总开关。14–21 点，最近聊天 30 分钟内推迟。",
     "default": true
   },
+  "low_steps_care": {
+    "type": "bool",
+    "description": "独立低步数关怀",
+    "hint": "北京时间20–21点随机检查一次；当天有效步数严格低于500才抽一次50%。其他项目合计最多2次/日；旧随机活动保持关闭。",
+    "default": false
+  },
   "auth_file": {
     "type": "string",
     "description": "凭证文件路径",

@@ -74,6 +74,7 @@ def sleep_record(snapshot, now):
         'record_id': record_id,
         'date': record_date,
         'fetched_at': fetched_at,
+        'source_modified_at': modified_at,
         'wake_at': wake_time,
         'due_at': wake_time + dt.timedelta(minutes=60),
     }
@@ -169,7 +170,14 @@ def choose_sleep_care(record_id, wake_time, rng=random):
     }
 
 
-def due_kind(state, snapshot, now, activated_at, last_user_activity=None):
+def due_kind(
+    state,
+    snapshot,
+    now,
+    activated_at,
+    last_user_activity=None,
+    include_sleep=True,
+):
     if (not isinstance(now, dt.datetime) or now.tzinfo is None
             or now.utcoffset() is None):
         return None
@@ -185,7 +193,7 @@ def due_kind(state, snapshot, now, activated_at, last_user_activity=None):
         due = _timestamp(state.get('sleep_care_due_at'))
         if state.get('sleep_care_selected') is not True:
             due = None
-    if (record and due is not None and sleep_candidate_is_stable(state, record['record_id'])
+    if (include_sleep and record and due is not None and sleep_candidate_is_stable(state, record['record_id'])
             and due >= activated_at and now >= due and now <= due + LATE_GRACE
             and not state.get('sleep_attempted')
             and state.get('sleep_attempted_record_id') != record['record_id']

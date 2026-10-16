@@ -13,6 +13,29 @@ import re
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+try:
+    from .period_flow import (
+        calendar_months_from_capture,
+        confirmed_end_record,
+        current_period_cluster,
+        period_end_inquiry_fact,
+        period_clusters,
+        post_period_care_fact,
+        period_cycle_id as period_cycle_id_for_start,
+        start_care_fact,
+    )
+except ImportError:  # Support focused tests importing the plugin directory directly.
+    from period_flow import (
+        calendar_months_from_capture,
+        confirmed_end_record,
+        current_period_cluster,
+        period_end_inquiry_fact,
+        period_clusters,
+        post_period_care_fact,
+        period_cycle_id as period_cycle_id_for_start,
+        start_care_fact,
+    )
+
 
 def event_key(rule_id: str, stable_event_id: str) -> str:
     return hashlib.sha256(f"{rule_id}\0{stable_event_id}".encode("utf-8")).hexdigest()
@@ -26,7 +49,7 @@ def enabled_capture_fields(config: object) -> list[str]:
     if any(
         isinstance(rules.get(rule_id), dict) and rules[rule_id].get("enabled") is True
         for rule_id in (
-            "predicted_period_lead", "confirmed_period_start", "confirmed_period_end",
+            "predicted_period_lead", "confirmed_period_start", "confirmed_period_end", "post_period_care",
             "period_late_inquiry",
         )
     ):
@@ -106,6 +129,10 @@ def _period_inquiry_draw(start_event_id: str, target_date: date) -> float:
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
+def _period_start_date_event_id(source: str, event_date: str) -> str:
+    return hashlib.sha256(f"{source}\0period-start\0{event_date}".encode("utf-8")).hexdigest()
+
+
 def _is_stale(
     observed_at: str | None,
     data_date: str | None,
@@ -142,14 +169,19 @@ def facts_from_capture(
     now: datetime,
     *,
     weight_mode_enabled_at: str | None = None,
+    requested_fields: list[str] | tuple[str, ...] | None = None,
     random_draw: Callable[[str, date], float] | None = None,
+    period_end_confirmation: object = None,
+    period_inquiry_sent_dates: set[str] | None = None,
+    period_confirmed_cycle_ids: set[str] | None = None,
+    period_postcare_cycle_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]]]:
     """Return minimal rule facts, private prompt contexts, and safe status rows.
 
-    The function intentionally does not infer a period end from a missing next
-    marker. Current cycle-calendar OCR exposes per-day marks, not explicit
-    confirmed start/end events, so those rules remain source-unavailable unless
-    a future adapter emits explicit event records.
+    Period dates are inferred only from fully classified, legend-verified
+    actual Calendar clusters with visible non-Period boundaries. End records
+    additionally require an explicit private user confirmation and a fresh
+    post-confirmation Calendar sync.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -161,6 +193,9 @@ def facts_from_capture(
     statuses: dict[str, dict[str, Any]] = {}
 
     cycle, cycle_status = _page(capture, "cycle_calendar")
+    calendar_months = calendar_months_from_capture(capture)
+    confirmed_cycles = period_confirmed_cycle_ids or set()
+    postcare_cycles = period_postcare_cycle_ids or set()
     cycle_rules = [
         rules.get(rule_id) for rule_id in (
             "predicted_period_lead", "confirmed_period_start", "confirmed_period_end",
@@ -216,16 +251,18 @@ def facts_from_capture(
                     }
                     stage_facts.append(fact)
                     contexts[event_key("predicted_period_lead", event_id)] = (
-                        f"OPPO 健康应用显示的预测日期还有 {lead_days} 天。"
-                        "这是预测，不代表经期已经开始。请用温和、不诊断的语气简短关心。"
+                        f"OPPO 预测经期还有 {lead_days} 天。请温和提醒，并自然问一句是否已经来。"
+                        "不要把预测当作实际开始；是否记录由本人手动完成，机器人只读同步、不修改记录。"
+                        "不要在关怀话术里复述这些限制。"
                     )
                 if stage_facts:
                     facts["predicted_period"] = stage_facts
 
-        # Only a future adapter with explicit event records may activate these
-        # rules. The current parser intentionally does not synthesize them from
-        # individual colored calendar days.
-        explicit_seen = {"confirmed_period_start": False, "confirmed_period_end": False}
+        explicit_seen = {
+            "confirmed_period_start": False,
+            "confirmed_period_end": False,
+            "post_period_care": False,
+        }
         period_rule_reasons = {}
         for rule_id, source, source_field, topic in (
             ("confirmed_period_start", "confirmed_period_start", "confirmed_period_start_events", "经期已明确确认开始"),
@@ -233,22 +270,85 @@ def facts_from_capture(
         ):
             rule = rules.get(rule_id)
             explicit = metrics.get(source_field)
+            if source == "confirmed_period_start" and isinstance(rule, dict):
+                derived_start = None
+                if rule.get("timezone") == "Asia/Shanghai":
+                    derived_start = start_care_fact(
+                        calendar_months, now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+                    )
+                if derived_start is not None:
+                    explicit = list(explicit) if isinstance(explicit, list) else []
+                    explicit.append({
+                        "event_id": derived_start["event_id"],
+                        "confirmed": True,
+                        "event_date": derived_start["event_date"],
+                        "date_precision": "date",
+                        "timezone": "Asia/Shanghai",
+                    })
+                else:
+                    navigation = capture.get("period_calendar_navigation") if isinstance(capture, dict) else None
+                    if not isinstance(navigation, dict) or navigation.get("status") != "complete":
+                        period_rule_reasons[source] = "上月完整 Calendar 不可用；经期开始边界缺少证据"
+                    else:
+                        period_rule_reasons[source] = "需要图例已验证、覆盖完整且前一日明确非 Period 的实际日期簇"
             collected = []
             if isinstance(rule, dict) and rule.get("enabled") is True and isinstance(explicit, list):
+                seen_event_ids: set[str] = set()
                 for row in explicit:
                     if not isinstance(row, dict) or row.get("confirmed") is not True:
                         continue
-                    occurred_at = _valid_timestamp(row.get("occurred_at"))
                     event_id = row.get("event_id")
-                    if occurred_at is None or not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 128:
+                    if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 128:
+                        continue
+                    if event_id.strip() in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event_id.strip())
+                    zone = ZoneInfo(rule["timezone"])
+                    local_today = now.astimezone(zone).date()
+                    window_end = time.fromisoformat(rule["send_window"]["end"])
+                    within_current_send_day = now.astimezone(zone).timetz().replace(tzinfo=None) < window_end
+                    if row.get("date_precision") == "date":
+                        event_date = _valid_date(row.get("event_date"))
+                        expected_id = (
+                            _period_start_date_event_id("oppo_health_ui_ocr", event_date)
+                            if event_date is not None else None
+                        )
+                        if (source != "confirmed_period_start"
+                                or rule.get("timezone") != "Asia/Shanghai"
+                                or row.get("timezone") != "Asia/Shanghai"
+                                or event_date is None or event_id.strip() != expected_id
+                                or derived_start is None
+                                or event_date != derived_start.get("event_date")):
+                            continue
+                        explicit_seen[source] = True
+                        day_number = (local_today - date.fromisoformat(event_date)).days + 1
+                        if not (1 <= day_number <= 3 and within_current_send_day):
+                            period_rule_reasons[source] = "只有明确 Day 1 日期之后的第 1–3 个 Asia/Shanghai 本地日会安排当日关怀"
+                            continue
+                        target_date = local_today
+                        stage_id = f"{event_id.strip()}:D{day_number}"
+                        collected.append({
+                            "event_id": stage_id,
+                            "confirmed": True,
+                            "event_date": event_date,
+                            "date_precision": "date",
+                            "timezone": "Asia/Shanghai",
+                            "observed_at": cycle["observed_at"],
+                            "target_date": target_date.isoformat(),
+                            "stage": day_number,
+                        })
+                        contexts[event_key(source, stage_id)] = (
+                            f"OPPO Calendar 的完整实际 Period 连续日期簇从记录日期开始；"
+                            f"今天是第 {day_number} 天。请用温和、不诊断的语气简短关心。"
+                        )
+                        continue
+
+                    occurred_at = _valid_timestamp(row.get("occurred_at"))
+                    if occurred_at is None:
                         continue
                     occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
                     explicit_seen[source] = True
-                    zone = ZoneInfo(rule["timezone"])
-                    local_today = now.astimezone(zone).date()
                     happened_date = occurred_dt.astimezone(zone).date()
-                    window_end = time.fromisoformat(rule["send_window"]["end"])
-                    within_current_send_day = now.astimezone(zone).timetz().replace(tzinfo=None) < window_end
                     if source == "confirmed_period_start":
                         day_number = (local_today - happened_date).days + 1
                         if not (1 <= day_number <= 3 and within_current_send_day):
@@ -286,6 +386,23 @@ def facts_from_capture(
             if collected:
                 facts[source] = collected
 
+        if cycle is not None and period_end_confirmation is not None:
+            end_record = confirmed_end_record(
+                calendar_months,
+                period_end_confirmation,
+                sync_observed_at=cycle["observed_at"],
+            )
+            if end_record is not None:
+                facts["confirmed_period_end"] = [end_record]
+                post_fact = post_period_care_fact(end_record)
+                if (post_fact is not None
+                        and post_fact.get("cycle_id") not in postcare_cycles):
+                    facts["post_period_care"] = [post_fact]
+                    contexts[event_key("post_period_care", post_fact["event_id"])] = (
+                        "本人已确认这次经期结束，且确认后的只读 Calendar 同步保留了实际日期簇末日。"
+                        "请用温和、不诊断的语气简短关心；不要提及或修改 OPPO 记录。"
+                    )
+
         cycle_date = period or (max(predicted + actual) if predicted or actual else None)
         predicted_rule_rows = [
             rule for rule_id, rule in rules.items()
@@ -307,6 +424,7 @@ def facts_from_capture(
             ("predicted_period", "predicted_period_lead", bool(facts.get("predicted_period"))),
             ("confirmed_period_start", "confirmed_period_start", bool(facts.get("confirmed_period_start"))),
             ("confirmed_period_end", "confirmed_period_end", bool(facts.get("confirmed_period_end"))),
+            ("post_period_care", "post_period_care", bool(facts.get("post_period_care"))),
         ):
             if source_id == "predicted_period":
                 continue
@@ -314,7 +432,10 @@ def facts_from_capture(
             statuses[source_id] = {
                 "source": source_id,
                 "status": "ok" if has_fact or explicit_seen[source_id] else ("unsupported" if enabled else "not_configured"),
-                "data_date": None,
+                "data_date": (
+                    facts.get(source_id, [{}])[0].get("event_date")
+                    if facts.get(source_id) else None
+                ),
                 "observed_at": cycle["observed_at"],
                 "is_stale": None,
                 "reason": (
@@ -362,104 +483,65 @@ def facts_from_capture(
         if cycle is None:
             late_status.update(
                 status="unavailable", evaluation_state="unavailable",
-                reason="本次经期来源读取不可用；等待明确开始与结束事件",
+                reason="本次经期来源读取不可用；等待完整 Calendar 实际日期簇",
             )
         else:
             zone = ZoneInfo(late_rule["timezone"])
             local_now = now.astimezone(zone)
             today = local_now.date()
-            metrics = cycle["metrics"]
-
-            def valid_events(field: str) -> list[dict[str, Any]] | None:
-                raw_events = metrics.get(field)
-                result = []
-                if not isinstance(raw_events, list):
-                    return None
-                seen = set()
-                for raw in raw_events:
-                    if not isinstance(raw, dict):
-                        return None
-                    if raw.get("confirmed") is not True:
-                        continue
-                    occurred_at = _valid_timestamp(raw.get("occurred_at"))
-                    event_id = raw.get("event_id")
-                    if (occurred_at is None or not isinstance(event_id, str)
-                            or not event_id.strip() or len(event_id) > 128):
-                        return None
-                    occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
-                    if occurred_dt > now:
-                        return None
-                    if event_id.strip() in seen:
-                        continue
-                    seen.add(event_id.strip())
-                    result.append({
-                        "event_id": event_id.strip(),
-                        "occurred_at": occurred_at,
-                        "occurred_dt": occurred_dt,
-                    })
-                return result
-
-            starts = valid_events("confirmed_period_start_events")
-            ends = valid_events("confirmed_period_end_events")
-            eligible_starts = [
-                event for event in (starts or [])
-                if event["occurred_dt"].astimezone(zone).date() <= today
-            ]
-            late_status.update(status="ok", data_date=None, observed_at=cycle["observed_at"])
-            if starts is None or ends is None:
-                late_status.update(
-                    status="unsupported", evaluation_state="unsupported",
-                    reason="来源没有同时提供明确经期开始和结束事件通道，或事件内容无效；后段询问保持暂停",
+            current = current_period_cluster(calendar_months, today)
+            late_status.update(status="ok", observed_at=cycle["observed_at"])
+            if current is None:
+                navigation = capture.get("period_calendar_navigation") if isinstance(capture, dict) else None
+                missing_reason = (
+                    "上月完整 Calendar 不可用，跨月边界缺少证据"
+                    if not isinstance(navigation, dict) or navigation.get("status") != "complete"
+                    else "等待图例和边界均可确认的实际 Period 连续日期簇"
                 )
-            elif not eligible_starts:
                 late_status.update(
                     evaluation_state="waiting_for_start",
-                    reason="等待本人在 OPPO 明确记录经期开始；逐日标记不能代替确认",
+                    reason=missing_reason,
                 )
             else:
-                start = max(eligible_starts, key=lambda event: event["occurred_dt"])
-                start_date = start["occurred_dt"].astimezone(zone).date()
-                period_day = (today - start_date).days + 1
-                late_status["data_date"] = start_date.isoformat()
-                ended = any(
-                    event["occurred_dt"] >= start["occurred_dt"] for event in ends
+                cluster, period_day = current
+                start_text = cluster["start_date"]
+                late_status["data_date"] = start_text
+                confirmation = (
+                    period_end_confirmation
+                    if isinstance(period_end_confirmation, dict)
+                    and period_end_confirmation.get("confirmed") is True
+                    and period_end_confirmation.get("period_start_date") == start_text
+                    else None
                 )
-                event_id = _period_inquiry_event_id(start["event_id"], today)
-                if ended:
-                    # The stable current-day ID cancels a pending inquiry immediately.
-                    facts["period_late_inquiry"] = [{
-                        "event_id": event_id,
-                        "cancelled": True,
-                        "confirmed_start": True,
-                        "start_occurred_at": start["occurred_at"],
-                        "observed_at": cycle["observed_at"],
-                        "data_date": today.isoformat(),
-                        "target_date": today.isoformat(),
-                        "period_day": period_day,
-                        "kind": "period_end_inquiry",
-                        "candidate_at": datetime.combine(
-                            today, time.fromisoformat(late_rule["send_window"]["start"]), tzinfo=zone
-                        ).isoformat(),
-                        "candidate_window_end": datetime.combine(
-                            today, time.fromisoformat(late_rule["send_window"]["end"]), tzinfo=zone
-                        ).isoformat(),
-                    }]
+                end_record = next((
+                    row for row in facts.get("confirmed_period_end", [])
+                    if isinstance(row, dict) and row.get("period_start_date") == start_text
+                ), None)
+                if period_cycle_id_for_start(start_text) in confirmed_cycles:
                     late_status.update(
-                        evaluation_state="ended",
-                        reason="OPPO 已明确记录经期结束；后段询问立即停止",
+                        evaluation_state="confirmation_processed",
+                        reason="本人已确认；后续不再询问，也不会重试确认后的同步",
                     )
-                elif period_day > late_rule["observation_window_days"]:
-                    late_status.update(
-                        evaluation_state="paused_window",
-                        reason=(
-                            f"已超过配置的 D{late_rule['observation_window_days']} 观察窗；"
-                            "暂停询问，等待 OPPO 明确结束记录"
-                        ),
-                    )
-                elif period_day < late_rule["start_day"]:
+                elif confirmation is not None:
+                    if end_record is not None:
+                        late_status.update(
+                            evaluation_state="ended",
+                            reason="本人在目标私聊明确确认；确认后的 Calendar 同步已更新本地结束记录",
+                        )
+                    else:
+                        late_status.update(
+                            evaluation_state="confirmation_sync_pending",
+                            reason="已收到明确确认；等待确认后的完整本地 Calendar 同步",
+                        )
+                elif period_day < 6:
                     late_status.update(
                         evaluation_state="waiting_for_late_phase",
-                        reason=f"当前为经期第 {period_day} 天；后段询问从 D{late_rule['start_day']} 开始",
+                        reason="后段问询仅在经期第 6–8 天进行",
+                    )
+                elif period_day > 8:
+                    late_status.update(
+                        evaluation_state="paused_window",
+                        reason="已超出经期第 6–8 天问询窗口；不再补问",
                     )
                 else:
                     send_start = datetime.combine(
@@ -474,47 +556,42 @@ def facts_from_capture(
                     elif local_now >= send_end:
                         late_status.update(
                             evaluation_state="missed_window",
-                            reason="已错过今日询问时段；不补发，明日重新按概率判断",
+                            reason="已错过今日问询时段；不补发",
+                        )
+                    elif period_inquiry_sent_dates and today.isoformat() in period_inquiry_sent_dates:
+                        late_status.update(
+                            evaluation_state="already_asked_today",
+                            reason="今日问询已发送；每天最多一次",
                         )
                     else:
-                        draw = (
-                            random_draw(start["event_id"], today)
-                            if random_draw is not None
-                            else _period_inquiry_draw(start["event_id"], today)
+                        fact = period_end_inquiry_fact(
+                            calendar_months,
+                            today,
+                            confirmed_end_start_dates={start_text} if confirmation else set(),
+                            already_asked_dates=period_inquiry_sent_dates,
                         )
-                        if (isinstance(draw, bool) or not isinstance(draw, (int, float))
-                                or not 0 <= draw < 1):
-                            raise ValueError("period inquiry random draw must be in [0, 1)")
-                        if draw < late_rule["probability"]:
-                            fact = {
-                                "event_id": event_id,
-                                "kind": "period_end_inquiry",
-                                "confirmed_start": True,
-                                "start_occurred_at": start["occurred_at"],
-                                "observed_at": cycle["observed_at"],
-                                "data_date": today.isoformat(),
-                                "target_date": today.isoformat(),
-                                "period_day": period_day,
-                                "candidate_at": send_start.isoformat(),
-                                "candidate_window_end": send_end.isoformat(),
-                            }
+                        if fact is not None:
+                            fact.update(
+                                confirmed_start=True,
+                                data_date=today.isoformat(),
+                                observed_at=cycle["observed_at"],
+                                candidate_at=send_start.isoformat(),
+                                candidate_window_end=send_end.isoformat(),
+                            )
                             facts["period_late_inquiry"] = [fact]
-                            contexts[event_key("period_late_inquiry", event_id)] = (
-                                "OPPO 健康应用有明确的经期开始记录，目前没有明确结束记录。"
-                                "只温和询问本人是否已结束；"
-                                "不要把未记录说成已结束，不要代替本人修改或记录 OPPO 经期数据，也不要诊断。"
+                            contexts[event_key("period_late_inquiry", fact["event_id"])] = (
+                                "请只问本人这次经期是否已经结束；不要推断结束日期，不把预测日期当成结束，"
+                                "不要把引用、否定或其他事情结束的话识别为确认。"
                             )
                             late_status.update(
                                 evaluation_state="candidate",
-                                reason=f"今日 D{period_day} 随机机会已选中；仍受 {late_rule['cooldown_days']} 天冷却和每日一次限制",
+                                reason=f"当前为经期第 {period_day} 天；今日问询事实已按日期生成，最多一次",
                             )
                         else:
                             late_status.update(
-                                evaluation_state="not_selected",
-                                reason=f"今日 D{period_day} 未命中 {late_rule['probability']:.0%} 随机机会；不补发，明日重新判断",
+                                evaluation_state="no_confirmed_cluster",
+                                reason="实际 Period 连续日期簇或其边界未完整确认；不问询",
                             )
-    else:
-        late_status["reason"] = None
     if late_enabled and cycle is not None and _is_stale(
         cycle["observed_at"], None, [late_rule], now
     ):
@@ -611,4 +688,89 @@ def facts_from_capture(
         "period_late_inquiry", "weight_entry",
     )
     source_statuses = [statuses[key] for key in order]
+    page_by_source = {
+        "predicted_period": "cycle_calendar",
+        "confirmed_period_start": "cycle_calendar",
+        "confirmed_period_end": "cycle_calendar",
+        "period_late_inquiry": "cycle_calendar",
+        "weight_entry": "weight_history",
+    }
+    rule_by_source = {
+        "predicted_period": "predicted_period_lead",
+        "confirmed_period_start": "confirmed_period_start",
+        "confirmed_period_end": "confirmed_period_end",
+        "period_late_inquiry": "period_late_inquiry",
+        "weight_entry": "weight_date_linked",
+    }
+    pages = capture.get("pages", {}) if isinstance(capture, dict) else {}
+    requested = set(requested_fields or ())
+    for row in source_statuses:
+        source = row["source"]
+        page_name = page_by_source[source]
+        rule = rules.get(rule_by_source[source])
+        page_item = pages.get(page_name) if isinstance(pages, dict) else None
+        page_data = page_item.get("data") if isinstance(page_item, dict) else None
+        metrics = page_data.get("metrics") if isinstance(page_data, dict) else None
+        if not isinstance(rule, dict) or rule.get("enabled") is not True:
+            collection_state = (
+                "rule_disabled_shared_capture"
+                if requested_fields is not None and page_name in requested
+                else "rule_disabled"
+            )
+        elif requested_fields is not None and page_name not in requested:
+            collection_state = "not_collected"
+        elif not isinstance(page_item, dict):
+            collection_state = "collection_failed"
+        elif source in {"confirmed_period_start", "confirmed_period_end", "period_late_inquiry"}:
+            explicit_key = {
+                "confirmed_period_start": "confirmed_period_start_events",
+                "confirmed_period_end": "confirmed_period_end_events",
+                "period_late_inquiry": "confirmed_period_start_events",
+            }[source]
+            explicit = metrics.get(explicit_key) if isinstance(metrics, dict) else None
+            visible_days = metrics.get("period_dates") if isinstance(metrics, dict) else None
+            if facts.get(source):
+                collection_state = "usable"
+            elif isinstance(explicit, list) and explicit:
+                collection_state = "usable" if facts.get(source) else "filtered"
+            elif isinstance(visible_days, list) and visible_days:
+                cluster_starts = [
+                    item for item in period_clusters(calendar_months)
+                    if item.get("start_confirmed") is True
+                ]
+                collection_state = "filtered" if cluster_starts else "evidence_unavailable"
+            elif page_item.get("status") == "ok":
+                collection_state = "no_records"
+            else:
+                collection_state = "collection_failed"
+        elif source == "predicted_period":
+            predictions = metrics.get("predicted_period_dates") if isinstance(metrics, dict) else None
+            if facts.get("predicted_period"):
+                collection_state = "usable"
+            elif isinstance(predictions, list) and predictions:
+                collection_state = "filtered"
+            elif page_item.get("status") == "ok":
+                collection_state = "no_records"
+            else:
+                collection_state = "collection_failed"
+        elif source == "weight_entry":
+            records = metrics.get("weight_history_records") if isinstance(metrics, dict) else None
+            if facts.get("weight_entry"):
+                collection_state = "usable"
+            elif isinstance(records, list) and records:
+                collection_state = "filtered"
+            elif isinstance(metrics, dict) and page_item.get("status") in {"ok", "no_visible_value"}:
+                collection_state = "no_records"
+            else:
+                collection_state = "collection_failed"
+        else:
+            collection_state = "collection_failed"
+        row["collection_state"] = collection_state
+        if collection_state == "evidence_unavailable":
+            row["reason"] = "日历覆盖、图例或实际 Period 簇边界未完整确认"
+        elif collection_state == "no_records":
+            row["reason"] = "已读取来源页面；当前页面没有该规则所需的记录"
+        elif collection_state == "filtered" and not row.get("reason"):
+            row["reason"] = "来源存在记录，但没有记录通过日期、时间或授权筛选"
+
     return facts, contexts, source_statuses

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta
+import hashlib
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -12,6 +13,7 @@ RULE_IDS = (
     "predicted_period_lead",
     "confirmed_period_start",
     "confirmed_period_end",
+    "post_period_care",
     "period_late_inquiry",
     "weight_date_linked",
     "wellness_low_state",
@@ -21,6 +23,7 @@ _RULE_FACTS = {
     "predicted_period_lead": "predicted_period",
     "confirmed_period_start": "confirmed_period_start",
     "confirmed_period_end": "confirmed_period_end",
+    "post_period_care": "post_period_care",
     "period_late_inquiry": "period_late_inquiry",
     "weight_date_linked": "weight_entry",
     "wellness_low_state": "wellness_low_state",
@@ -53,7 +56,7 @@ def _wellness_rule_default() -> dict[str, Any]:
     return {
         **_rule_default(),
         "max_per_day": 7,
-        "mode": "unconfirmed",
+        "mode": "slow_down_category",
         "timezone_confirmed": False,
         "low_score_threshold": None,
         "confirmation_minutes": None,
@@ -67,13 +70,13 @@ def _wellness_rule_default() -> dict[str, Any]:
 
 
 def _period_late_inquiry_default() -> dict[str, Any]:
-    """Return a closed, explicitly event-gated late-cycle inquiry rule."""
+    """Return a closed D6–D8 daily inquiry rule; user confirmation gates ending."""
     return {
         **_rule_default(),
-        "start_day": 4,
-        "probability": 0.5,
+        "start_day": 6,
+        "probability": 1.0,
         "cooldown_days": 1,
-        "observation_window_days": 14,
+        "observation_window_days": 8,
     }
 
 
@@ -89,6 +92,7 @@ def default_config() -> dict[str, Any]:
             "predicted_period_lead": _rule_default(lead_days=3),
             "confirmed_period_start": _rule_default(),
             "confirmed_period_end": _rule_default(),
+            "post_period_care": _rule_default(),
             "period_late_inquiry": _period_late_inquiry_default(),
             "weight_date_linked": _rule_default(),
             "wellness_low_state": _wellness_rule_default(),
@@ -248,17 +252,17 @@ def validate_config(payload: object) -> dict[str, Any]:
             cooldown_days = rule["cooldown_days"]
             observation_window_days = rule["observation_window_days"]
             probability = rule["probability"]
-            if isinstance(start_day, bool) or not isinstance(start_day, int) or not 4 <= start_day <= 30:
-                raise ValueError("period_late_inquiry.start_day must be between 4 and 30")
+            if isinstance(start_day, bool) or not isinstance(start_day, int) or start_day != 6:
+                raise ValueError("period_late_inquiry.start_day is fixed at 6")
             if isinstance(cooldown_days, bool) or not isinstance(cooldown_days, int) or not 1 <= cooldown_days <= 30:
                 raise ValueError("period_late_inquiry.cooldown_days must be between 1 and 30")
             if (isinstance(observation_window_days, bool)
                     or not isinstance(observation_window_days, int)
-                    or not start_day <= observation_window_days <= 60):
-                raise ValueError("period_late_inquiry.observation_window_days must be at least start_day and at most 60")
+                    or observation_window_days != 8):
+                raise ValueError("period_late_inquiry.observation_window_days is fixed at 8")
             if (isinstance(probability, bool) or not isinstance(probability, (int, float))
-                    or not 0 <= probability <= 1):
-                raise ValueError("period_late_inquiry.probability must be between 0 and 1")
+                    or float(probability) != 1.0):
+                raise ValueError("period_late_inquiry.probability is fixed at 1.0")
             normalized_rule.update(
                 start_day=start_day,
                 probability=float(probability),
@@ -294,6 +298,16 @@ def validate_config(payload: object) -> dict[str, Any]:
                 low, recovery = rule["low_score_threshold"], rule["recovery_score_threshold"]
                 if low is not None and recovery is not None and recovery <= low:
                     raise ValueError("wellness recovery threshold must exceed the low threshold")
+            cooldown_minutes = rule["repeat_cooldown_minutes"]
+            if cooldown_minutes is not None:
+                window_start = _clock_minutes(send_window["start"], "send_window.start")
+                window_end = _clock_minutes(send_window["end"], "send_window.end")
+                window_minutes = window_end - window_start
+                if cooldown_minutes >= window_minutes:
+                    raise ValueError("wellness cooldown must be shorter than its daily send window")
+                average_cooldown_window = cooldown_minutes - cooldown_minutes**2 / (2 * window_minutes)
+                if weekly_target * average_cooldown_window >= 7 * window_minutes:
+                    raise ValueError("wellness weekly target is infeasible with the configured cooldown")
             for name in nullable_ranges:
                 normalized_rule[name] = rule[name]
             required_common = (
@@ -312,7 +326,7 @@ def validate_config(payload: object) -> dict[str, Any]:
             )
             if rule["enabled"] and not configured:
                 raise ValueError(
-                    "wellness_low_state cannot be enabled until its mode, timezone, and thresholds are confirmed"
+                    "wellness_low_state requires a confirmed mode, timezone, and sustained-state settings"
                 )
             normalized_rule.update(
                 mode=mode,
@@ -403,6 +417,10 @@ def build_preview_plan(
         freshness_at = observed_at
         source_date = None
         occurred_at = None
+        source_start_date = None
+        date_only_start = False
+        date_only_end = False
+        date_only_post = False
         if rule_id == "predicted_period_lead":
             if fact.get("kind") != "prediction":
                 row.update(state="invalid_source", reason="需要明确标记为预测的数据")
@@ -426,15 +444,84 @@ def build_preview_plan(
                 )
                 plans.append(row)
                 continue
-            occurred_at = _parse_aware_datetime(fact.get("occurred_at"))
-            if occurred_at is None or occurred_at > now:
-                row.update(state="invalid_source", reason="确认事件时间无效")
-                plans.append(row)
-                continue
             stage = fact.get("stage")
+            if fact.get("date_precision") == "date":
+                event_date = _parse_date(fact.get("event_date"))
+                if rule_id == "confirmed_period_start":
+                    stable_id = (
+                        hashlib.sha256(
+                            f"oppo_health_ui_ocr\0period-start\0{event_date.isoformat()}".encode("utf-8")
+                        ).hexdigest()
+                        if event_date is not None else None
+                    )
+                    stable_id = (
+                        f"{stable_id}:D{stage}"
+                        if stable_id is not None and isinstance(stage, int) and not isinstance(stage, bool)
+                        else stable_id
+                    )
+                    if (rule["timezone"] != "Asia/Shanghai"
+                            or fact.get("timezone") != "Asia/Shanghai"
+                            or event_date is None
+                            or event_date > now.astimezone(local_zone).date()
+                            or fact.get("event_id") != stable_id):
+                        row.update(state="invalid_source", reason="日期级开始证据无效或时区不匹配")
+                        plans.append(row)
+                        continue
+                    if (isinstance(stage, bool) or not isinstance(stage, int) or not 1 <= stage <= 3):
+                        row.update(state="invalid_source", reason="日期级开始证据只支持第 1–3 天")
+                        plans.append(row)
+                        continue
+                    source_start_date = event_date
+                    source_date = event_date
+                    date_only_start = True
+                    freshness_at = observed_at
+                elif rule_id == "confirmed_period_end":
+                    start_date = _parse_date(fact.get("period_start_date"))
+                    confirmed_at = _parse_aware_datetime(fact.get("confirmed_at"))
+                    end_id = (
+                        hashlib.sha256(
+                            f"oppo_health_ui_ocr\0period-end\0{start_date.isoformat()}\0{event_date.isoformat()}".encode("utf-8")
+                        ).hexdigest()
+                        if start_date is not None and event_date is not None else None
+                    )
+                    confirmation_day = (
+                        confirmed_at.astimezone(local_zone).date() if confirmed_at is not None else None
+                    )
+                    if (
+                        rule["timezone"] != "Asia/Shanghai"
+                        or fact.get("timezone") != "Asia/Shanghai"
+                        or fact.get("bot_local_only") is not True
+                        or fact.get("confirmation_source") != "target_private_plain_reply"
+                        or fact.get("end_boundary_classified") is not True
+                        or start_date is None or event_date is None or event_date > now.astimezone(local_zone).date()
+                        or confirmation_day is None or observed_at < confirmed_at
+                        or (confirmation_day - start_date).days + 1 not in {6, 7, 8}
+                        or event_date > confirmation_day
+                        or fact.get("event_id") != end_id
+                    ):
+                        row.update(state="invalid_source", reason="结束记录缺少有效的本人确认、完整边界或确认后同步")
+                        plans.append(row)
+                        continue
+                    source_date = event_date
+                    date_only_end = True
+                    freshness_at = observed_at
+                else:
+                    row.update(state="invalid_source", reason="日期级事件只支持经期开始或经期结束")
+                    plans.append(row)
+                    continue
+            else:
+                occurred_at = _parse_aware_datetime(fact.get("occurred_at"))
+                if occurred_at is None or occurred_at > now:
+                    row.update(state="invalid_source", reason="确认事件时间无效")
+                    plans.append(row)
+                    continue
+                source_start_date = occurred_at.astimezone(local_zone).date()
             if rule_id == "confirmed_period_start" and stage is not None:
                 stage_date = _parse_date(fact.get("target_date"))
-                source_start_date = occurred_at.astimezone(local_zone).date()
+                if source_start_date is None:
+                    row.update(state="invalid_source", reason="经期开始日期无效")
+                    plans.append(row)
+                    continue
                 if (isinstance(stage, bool) or not isinstance(stage, int) or not 1 <= stage <= 3
                         or stage_date != source_start_date + timedelta(days=stage - 1)
                         or stage_date != now.astimezone(local_zone).date()):
@@ -442,8 +529,41 @@ def build_preview_plan(
                     plans.append(row)
                     continue
                 freshness_at = observed_at
-            else:
+            elif not date_only_end:
                 freshness_at = occurred_at
+        elif rule_id == "post_period_care":
+            start_date = _parse_date(fact.get("start_date"))
+            event_date = _parse_date(fact.get("event_date"))
+            target_date = _parse_date(fact.get("target_date"))
+            confirmed_at = _parse_aware_datetime(fact.get("confirmed_at"))
+            cycle_identity = fact.get("cycle_id")
+            event_id = fact.get("event_id")
+            if (
+                fact.get("confirmed") is not True
+                or fact.get("bot_local_only") is not True
+                or fact.get("once_per_cycle") is not True
+                or fact.get("date_precision") != "date"
+                or fact.get("confirmation_source") != "target_private_plain_reply"
+                or rule["timezone"] != "Asia/Shanghai"
+                or start_date is None or event_date is None or target_date is None
+                or confirmed_at is None
+                or not isinstance(cycle_identity, str) or len(cycle_identity) != 64
+                or not isinstance(event_id, str) or len(event_id) != 64
+                or fact.get("cycle_id") != hashlib.sha256(
+                    f"oppo-calendar-cycle-v1\0{start_date.isoformat()}".encode("utf-8")
+                ).hexdigest()
+                or event_date < start_date
+                or event_date > target_date
+                or target_date != confirmed_at.astimezone(local_zone).date()
+                or event_date > now.astimezone(local_zone).date()
+                or observed_at < confirmed_at
+            ):
+                row.update(state="invalid_source", reason="经期后关怀需要本人确认及确认后的本地结束事实")
+                plans.append(row)
+                continue
+            source_date = event_date
+            freshness_at = observed_at
+            date_only_post = True
         elif rule_id in {"wellness_low_state", "sunlight_evening", "period_late_inquiry"}:
             source_date = _parse_date(fact.get("data_date"))
             candidate_at = _parse_aware_datetime(fact.get("candidate_at"))
@@ -466,20 +586,18 @@ def build_preview_plan(
                 plans.append(row)
                 continue
             if rule_id == "period_late_inquiry":
-                occurred_at = _parse_aware_datetime(fact.get("start_occurred_at"))
+                actual_start_date = _parse_date(fact.get("start_date"))
                 target_date = _parse_date(fact.get("target_date"))
                 period_day = fact.get("period_day")
                 ended = fact.get("ended")
-                actual_start_date = occurred_at.astimezone(local_zone).date() if occurred_at else None
-                if (fact.get("confirmed_start") is not True or occurred_at is None
-                        or occurred_at > now or target_date != source_date
+                if (fact.get("confirmed_start") is not True or actual_start_date is None
+                        or actual_start_date > now.astimezone(local_zone).date()
+                        or target_date != source_date
                         or target_date != now.astimezone(local_zone).date()
                         or isinstance(period_day, bool) or not isinstance(period_day, int)
-                        or period_day < rule["start_day"]
-                        or period_day > rule["observation_window_days"]
-                        or actual_start_date is None
+                        or period_day not in {6, 7, 8}
                         or (target_date - actual_start_date).days + 1 != period_day):
-                    row.update(state="invalid_source", reason="需要观察窗内的明确经期开始事件")
+                    row.update(state="invalid_source", reason="需要完整 Calendar 实际日期簇确认的 D6–D8 问询事实")
                     plans.append(row)
                     continue
                 if ended is True:
@@ -496,7 +614,7 @@ def build_preview_plan(
             basis = {
                 "wellness_low_state": "连续低状态来源样本",
                 "sunlight_evening": "当天明确日照记录",
-                "period_late_inquiry": "本人在 OPPO 明确记录的经期开始日之后的后段询问机会",
+                "period_late_inquiry": "完整 Calendar 实际日期簇确认的经期第 6–8 天问询机会",
             }[rule_id]
             target_date = source_date
             is_actual = True
@@ -560,8 +678,31 @@ def build_preview_plan(
             basis = "预测经期日期"
             is_actual = False
         elif rule_id in {"confirmed_period_start", "confirmed_period_end"}:
-            target_date = _parse_date(fact.get("target_date")) or occurred_at.astimezone(ZoneInfo(rule["timezone"])).date()
-            basis = f"明确开始事件第{fact['stage']}日" if rule_id == "confirmed_period_start" and fact.get("stage") else "明确确认的经期事件"
+            if date_only_end:
+                target_date = _parse_date(fact.get("target_date"))
+                if target_date is None:
+                    row.update(state="invalid_source", reason="本人确认日期无效")
+                    plans.append(row)
+                    continue
+                basis = "本人确认后新鲜同步的同一 Calendar 实际日期簇末日"
+            else:
+                fallback_date = source_start_date if date_only_start else occurred_at.astimezone(ZoneInfo(rule["timezone"])).date()
+                target_date = _parse_date(fact.get("target_date")) or fallback_date
+                basis = (
+                    f"Calendar 连续实际 Period 日期簇确认的第{fact['stage']}日"
+                    if date_only_start and rule_id == "confirmed_period_start"
+                    else f"明确开始事件第{fact['stage']}日"
+                    if rule_id == "confirmed_period_start" and fact.get("stage")
+                    else "明确确认的经期事件"
+                )
+            is_actual = True
+        elif date_only_post:
+            target_date = _parse_date(fact.get("target_date"))
+            if target_date is None:
+                row.update(state="invalid_source", reason="本人确认日期无效")
+                plans.append(row)
+                continue
+            basis = "本人确认后新鲜同步的经期后关怀（每个周期一次）"
             is_actual = True
         else:
             target_date = source_date
@@ -578,7 +719,11 @@ def build_preview_plan(
             expected_at=start_at.isoformat(),
             expected_window_end=end_at.isoformat(),
             basis=basis,
-            source_date=(source_date.isoformat() if rule_id == "predicted_period_lead" else target_date.isoformat()),
+            source_date=(
+                source_date.isoformat()
+                if rule_id == "predicted_period_lead" or date_only_end or date_only_post
+                else target_date.isoformat()
+            ),
             target_date=target_date.isoformat(),
             is_actual_event=is_actual,
         )

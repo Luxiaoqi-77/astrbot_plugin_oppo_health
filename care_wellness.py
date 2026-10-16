@@ -19,6 +19,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 CATEGORIES = {"Excellent", "Good", "Moderate", "Slow down"}
+CATEGORY_ALIASES = {
+    "Excellent": "Excellent",
+    "Good": "Good",
+    "Moderate": "Moderate",
+    "Slow down": "Slow down",
+    "状态优秀": "Excellent",
+    "状态不错": "Good",
+    "状态正常": "Moderate",
+    "适当放松": "Slow down",
+}
 _STATE_KEYS = {
     "schema_version", "armed", "low_started_at", "low_sample_count",
     "recovery_started_at", "recovery_sample_count", "last_sample_id",
@@ -114,6 +124,28 @@ def _int_or_none(value: object, low: int, high: int) -> bool:
     return value is None or (type(value) is int and low <= value <= high)
 
 
+def _normalize_category(value: object) -> str | None:
+    """Map verified OPPO category labels to their canonical values.
+
+    Args:
+        value: Category text from the local OCR adapter.
+
+    Returns:
+        The canonical category, or None for an unknown label.
+    """
+    if not isinstance(value, str):
+        return None
+    label = value.strip()
+    direct = CATEGORY_ALIASES.get(label)
+    if direct is not None:
+        return direct
+    return next(
+        (canonical for alias, canonical in CATEGORY_ALIASES.items()
+         if alias.isascii() and alias.casefold() == label.casefold()),
+        None,
+    )
+
+
 def _configured(rule: object) -> tuple[str, str]:
     if not isinstance(rule, dict) or rule.get("enabled") is not True:
         return "disabled", "身心状态关怀已关闭"
@@ -141,6 +173,21 @@ def _configured(rule: object) -> tuple[str, str]:
     }
     if any(not _int_or_none(rule.get(key), *bounds) for key, bounds in ranges.items()):
         return "invalid_settings", "持续低值参数超出支持范围"
+    if isinstance(rule.get("repeat_cooldown_minutes"), int):
+        window_start = time.fromisoformat(rule["send_window"]["start"])
+        window_end = time.fromisoformat(rule["send_window"]["end"])
+        window_minutes = int((
+            datetime.combine(date.min, window_end) - datetime.combine(date.min, window_start)
+        ).total_seconds() // 60)
+        if rule["repeat_cooldown_minutes"] >= window_minutes:
+            return "invalid_settings", "提醒冷却必须短于每日可发送时段"
+        average_cooldown_window = (
+            rule["repeat_cooldown_minutes"]
+            - rule["repeat_cooldown_minutes"] ** 2 / (2 * window_minutes)
+        )
+        weekly_window_minutes = 7 * window_minutes
+        if rule["weekly_target"] * average_cooldown_window >= weekly_window_minutes:
+            return "invalid_settings", "当前发送时段和冷却无法达到每周频率目标"
     try:
         ZoneInfo(rule.get("timezone"))
     except (TypeError, ValueError, ZoneInfoNotFoundError):
@@ -179,13 +226,13 @@ def sample_from_capture(
     metrics = data.get("metrics")
     if not isinstance(metrics, dict) or metrics.get("kind") != "home_point":
         return None, "unknown_measurement_kind"
-    category = metrics.get("category")
-    if not isinstance(category, str) or category not in CATEGORIES:
+    category = _normalize_category(metrics.get("category"))
+    if category not in CATEGORIES:
         return None, "missing_or_invalid_category"
-    score = metrics.get("score")
-    if score is not None and (type(score) is not int or not 0 <= score <= 999):
-        return None, "missing_or_invalid_score"
-    if rule.get("mode") == "numeric" and score is None:
+    score = metrics.get("score") if rule.get("mode") == "numeric" else None
+    if rule.get("mode") == "numeric" and (
+        type(score) is not int or not 0 <= score <= 999
+    ):
         return None, "missing_or_invalid_score"
     point_time = metrics.get("point_time_local")
     if not isinstance(point_time, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", point_time):
@@ -236,8 +283,7 @@ def wellness_source_summary(capture: object, timezone: str, now: datetime) -> di
     point_time = metrics.get("point_time_local")
     if isinstance(point_time, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", point_time):
         summary["measured_at"] = f"{summary['data_date'] or '未知日期'} {point_time}（设备本地时间）"
-    category = metrics.get("category")
-    summary["category"] = category if isinstance(category, str) and category in CATEGORIES else None
+    summary["category"] = _normalize_category(metrics.get("category"))
     quality = metrics.get("quality_label") or metrics.get("quality")
     if isinstance(quality, str) and len(quality) <= 64:
         summary["quality"] = quality
@@ -308,6 +354,7 @@ def evaluate_capture(
         "completeness": "未知",
         "sample_id": None,
         "low_confirmed": False,
+        "eligible_interval_minutes": 0,
     }
     if config_state != "ready" or not isinstance(rule, dict):
         state["last_reason_code"] = config_state
@@ -361,6 +408,10 @@ def evaluate_capture(
     low_now = _low(sample, rule)
     low_start = _aware(state.get("low_started_at"))
     if not state["armed"] and state.get("current_episode_id"):
+        previous_was_low = state.get("last_reason_code") in {
+            "low_episode_confirmed", "episode_active", "reminder_reserved",
+            "sampled_no_reminder", "reminder_cooldown", "outside_send_window",
+        }
         if _recovered(sample, rule):
             if state.get("recovery_started_at") is None:
                 state["recovery_started_at"] = sample.measured_at.isoformat()
@@ -394,9 +445,13 @@ def evaluate_capture(
             state["low_started_at"] = None
             state["low_sample_count"] = 0
         state["last_reason_code"] = "episode_active" if low_now else "episode_active_waiting_low_sample"
+        eligible_interval_minutes = 0
+        if low_now and low_confirmed and previous_was_low and previous_at is not None:
+            eligible_interval_minutes = _send_window_overlap_minutes(previous_at, sample.measured_at, rule)
         return state, {**status, "status": "episode_latched", "reason_code": state["last_reason_code"],
                        "reason": "同一持续状态仍在跟踪；需要新的有效样本及间隔后才可能再次关怀",
-                       "low_confirmed": low_confirmed}, sample
+                       "low_confirmed": low_confirmed,
+                       "eligible_interval_minutes": eligible_interval_minutes}, sample
 
     if low_now:
         if low_start is None:
@@ -427,37 +482,59 @@ def evaluate_capture(
                    "reason": "当前有效记录未达到已确认的低值条件"}, sample
 
 
-def ensure_weekly_slots(
-    state: dict[str, Any],
-    now: datetime,
-    rule: dict[str, Any],
-    *,
-    chooser: Any = random.SystemRandom(),
-) -> dict[str, Any]:
-    """Persist a random set of weekly times inside the chosen local window."""
+def _send_window_overlap_minutes(start: datetime, end: datetime, rule: dict[str, Any]) -> float:
+    """Count only active send-window minutes between two source samples."""
+    if end <= start:
+        return 0.0
     zone = ZoneInfo(rule["timezone"])
-    local_now = now.astimezone(zone)
-    monday = local_now.date() - timedelta(days=local_now.weekday())
-    week_id = f"{monday.isocalendar().year}-W{monday.isocalendar().week:02d}"
-    if state.get("schedule_week") == week_id and len(state.get("weekly_slots", [])) == rule["weekly_target"]:
-        return state
-    start = time.fromisoformat(rule["send_window"]["start"])
-    end = time.fromisoformat(rule["send_window"]["end"])
-    span = int((datetime.combine(monday, end) - datetime.combine(monday, start)).total_seconds() // 60)
-    if span < 1:
-        raise ValueError("wellness send window has no minutes")
-    population = 7 * span
-    if rule["weekly_target"] > population:
-        raise ValueError("weekly target exceeds the available send minutes")
-    selections = sorted(chooser.sample(range(population), rule["weekly_target"]))
-    slots = []
-    for selection in selections:
-        day_offset, minute_offset = divmod(selection, span)
-        slot_day = monday + timedelta(days=day_offset)
-        slot = datetime.combine(slot_day, start, tzinfo=zone) + timedelta(minutes=minute_offset)
-        slots.append(slot.isoformat())
-    state.update(schedule_week=week_id, weekly_slots=slots, used_slots=[])
-    return state
+    local_start = start.astimezone(zone)
+    local_end = end.astimezone(zone)
+    window_start = time.fromisoformat(rule["send_window"]["start"])
+    window_end = time.fromisoformat(rule["send_window"]["end"])
+    total = 0.0
+    day = local_start.date()
+    while day <= local_end.date():
+        day_start = datetime.combine(day, window_start, tzinfo=zone)
+        day_end = datetime.combine(day, window_end, tzinfo=zone)
+        overlap_start = max(start, day_start)
+        overlap_end = min(end, day_end)
+        if overlap_end > overlap_start:
+            total += (overlap_end - overlap_start).total_seconds() / 60
+        day += timedelta(days=1)
+    return total
+
+
+def weekly_event_hazard_per_minute(rule: dict[str, Any]) -> float:
+    """Calibrate a Poisson hazard for the weekly mean and refractory cooldown.
+
+    Args:
+        rule: A validated wellness rule.
+
+    Returns:
+        The event-sampling hazard per eligible send-window minute.
+    """
+    window_start = time.fromisoformat(rule["send_window"]["start"])
+    window_end = time.fromisoformat(rule["send_window"]["end"])
+    window_minutes = int((
+        datetime.combine(date.min, window_end) - datetime.combine(date.min, window_start)
+    ).total_seconds() // 60)
+    cooldown = rule["repeat_cooldown_minutes"]
+    if window_minutes < 1 or cooldown >= window_minutes:
+        raise ValueError("cooldown must be shorter than the daily send window")
+    average_cooldown_window = cooldown - cooldown**2 / (2 * window_minutes)
+    weekly_window_minutes = 7 * window_minutes
+    denominator = weekly_window_minutes - rule["weekly_target"] * average_cooldown_window
+    if denominator <= 0:
+        raise ValueError("weekly target is infeasible with the configured cooldown")
+    return rule["weekly_target"] / denominator
+
+
+def weekly_event_sample_probability(eligible_minutes: float, rule: dict[str, Any]) -> float:
+    """Return the Poisson hazard probability for one fresh eligible sample."""
+    if eligible_minutes <= 0:
+        return 0.0
+    hazard = weekly_event_hazard_per_minute(rule)
+    return -math.expm1(-hazard * eligible_minutes)
 
 
 def weekly_candidate(
@@ -466,53 +543,76 @@ def weekly_candidate(
     status: dict[str, Any],
     rule: dict[str, Any],
     now: datetime,
+    *,
+    chooser: Any = random.SystemRandom(),
 ) -> tuple[dict[str, Any], dict[str, Any] | None, str]:
-    """Claim one due random slot only for a fresh, new sample in active low state."""
-    state = ensure_weekly_slots(state, now, rule)
+    """Sample a new qualifying event at a probability calibrated to weekly mean.
+
+    Args:
+        state: Metadata-only wellness runtime state.
+        sample: The newly validated source point, if available.
+        status: Evaluation result for this capture.
+        rule: A validated wellness rule.
+        now: Time at which the source point was checked.
+        chooser: Random source used once for this distinct source point.
+
+    Returns:
+        Updated runtime metadata, an event fact when sampled, and a safe status.
+    """
+    if status.get("status") == "duplicate_sample":
+        return state, None, "同一测量时间点已处理，不重复抽样"
     zone = ZoneInfo(rule["timezone"])
     local_now = now.astimezone(zone)
-    end_of_window = time.fromisoformat(rule["send_window"]["end"])
-    last_reminder = _aware(state.get("last_reminder_at"))
-    cooldown = timedelta(minutes=rule["repeat_cooldown_minutes"])
-    for slot_text in state["weekly_slots"]:
-        slot = _aware(slot_text)
-        if slot is None or slot_text in state["used_slots"]:
-            continue
-        slot_end = min(slot + timedelta(minutes=15), datetime.combine(slot.date(), end_of_window, tzinfo=zone))
-        if now < slot or now > slot_end:
-            if now > slot_end:
-                state["used_slots"].append(slot_text)
-            continue
-        state["used_slots"].append(slot_text)
-        if status.get("low_confirmed") is not True or sample is None or not state.get("current_episode_id"):
-            return state, None, "随机时段已到；当前没有满足持续条件的新样本"
-        if sample.sample_id == state.get("last_reminder_sample_id"):
-            return state, None, "这条测量记录已用于此前关怀"
-        if last_reminder is not None and now - last_reminder < cooldown:
-            return state, None, "同一持续状态仍在提醒间隔内"
-        slot_key = slot.strftime("%Y%m%dT%H%M%z")
-        event_id = hashlib.sha256(
-            f"{state['current_episode_id']}\0{sample.sample_id}\0{slot_key}".encode()
-        ).hexdigest()
-        state.update(
-            last_reminder_at=now.isoformat(),
-            last_reminder_sample_id=sample.sample_id,
-            last_reminder_episode_id=state["current_episode_id"],
-            last_reason_code="reminder_reserved",
-        )
-        fact = {
-            "event_id": event_id,
-            "kind": "sustained_low_state",
-            "data_date": sample.data_date.isoformat(),
-            "observed_at": sample.updated_at.isoformat(),
-            "candidate_at": slot.isoformat(),
-            "candidate_window_end": slot_end.isoformat(),
-        }
-        return state, fact, "满足持续低值条件并占用一个随机时段"
-    next_slot = next((slot for slot in state["weekly_slots"] if slot not in state["used_slots"]), None)
-    reason = "等待下一个随机关怀时段" if next_slot else "本周随机时段已用完"
-    return state, None, reason
+    send_start = time.fromisoformat(rule["send_window"]["start"])
+    send_end = time.fromisoformat(rule["send_window"]["end"])
+    local_clock = local_now.timetz().replace(tzinfo=None)
+    if not send_start <= local_clock < send_end:
+        state["last_reason_code"] = "outside_send_window"
+        return state, None, "当前不在主动关怀时段，跳过本次来源样本"
+    if status.get("low_confirmed") is not True or sample is None or not state.get("current_episode_id"):
+        return state, None, "当前没有满足持续条件的新样本"
+    if sample.sample_id == state.get("last_reminder_sample_id"):
+        return state, None, "这条测量记录已用于此前关怀"
 
+    cooldown = timedelta(minutes=rule["repeat_cooldown_minutes"])
+    last_reminder = _aware(state.get("last_reminder_at"))
+    if last_reminder is not None and now - last_reminder < cooldown:
+        state["last_reason_code"] = "reminder_cooldown"
+        return state, None, "同一持续状态仍在提醒冷却期"
+    elapsed = status.get("eligible_interval_minutes", 0)
+    if type(elapsed) not in {int, float} or elapsed <= 0:
+        return state, None, "等待下一条连续、独立且新鲜的状态样本"
+    eligible_start = sample.measured_at - timedelta(minutes=elapsed)
+    if last_reminder is not None:
+        eligible_start = max(eligible_start, last_reminder + cooldown)
+    eligible_minutes = _send_window_overlap_minutes(eligible_start, sample.measured_at, rule)
+    probability = weekly_event_sample_probability(eligible_minutes, rule)
+    if chooser.random() >= probability:
+        state["last_reason_code"] = "sampled_no_reminder"
+        return state, None, "本条合格样本未抽中；后续独立样本仍可参加抽样"
+
+    event_id = hashlib.sha256(
+        f"{state['current_episode_id']}\0{sample.sample_id}".encode()
+    ).hexdigest()
+    window_end = min(
+        now + timedelta(minutes=15),
+        datetime.combine(local_now.date(), send_end, tzinfo=zone),
+    )
+    state.update(
+        last_reminder_at=now.isoformat(),
+        last_reminder_sample_id=sample.sample_id,
+        last_reminder_episode_id=state["current_episode_id"],
+        last_reason_code="reminder_reserved",
+    )
+    fact = {
+        "event_id": event_id,
+        "kind": "sustained_low_state",
+        "data_date": sample.data_date.isoformat(),
+        "observed_at": sample.updated_at.isoformat(),
+        "candidate_at": now.isoformat(),
+        "candidate_window_end": window_end.isoformat(),
+    }
+    return state, fact, "符合持续条件的新样本抽中关怀机会"
 
 def sunlight_candidate(
     capture: object,

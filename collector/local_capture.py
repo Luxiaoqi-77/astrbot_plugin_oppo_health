@@ -18,9 +18,41 @@ from typing import Any
 from local_health_adapter import parse_local_page
 
 
-ADB = os.environ.get("OPPO_HEALTH_ADB") or shutil.which("adb")
-ADB_SERVER_PORT = os.environ.get("OPPO_HEALTH_ADB_SERVER_PORT")
-ADB_SERIAL = os.environ.get("OPPO_HEALTH_EMULATOR_SERIAL", "")
+_PRIVATE_ADB = (
+    Path.home()
+    / ".local/share/astrbot-oppo-health/emulator/sdk/platform-tools/adb"
+)
+_PRIVATE_ADB_PORT = "5038"
+_PRIVATE_ADB_SERIAL = "emulator-5576"
+
+
+def _resolve_adb_config() -> tuple[str | None, str | None, str]:
+    """Use the previously approved local emulator only when its saved SDK exists."""
+    configured_adb = os.environ.get("OPPO_HEALTH_ADB")
+    if configured_adb:
+        adb = str(Path(configured_adb).expanduser())
+    elif _PRIVATE_ADB.is_file() and os.access(_PRIVATE_ADB, os.X_OK):
+        adb = str(_PRIVATE_ADB)
+    else:
+        adb = shutil.which("adb")
+
+    try:
+        is_private_adb = bool(
+            adb and Path(adb).expanduser().resolve(strict=False)
+            == _PRIVATE_ADB.resolve(strict=False)
+        )
+    except (OSError, RuntimeError):
+        is_private_adb = False
+
+    server_port = os.environ.get("OPPO_HEALTH_ADB_SERVER_PORT")
+    serial = os.environ.get("OPPO_HEALTH_EMULATOR_SERIAL", "")
+    if is_private_adb:
+        server_port = server_port or _PRIVATE_ADB_PORT
+        serial = serial or _PRIVATE_ADB_SERIAL
+    return adb, server_port, serial
+
+
+ADB, ADB_SERVER_PORT, ADB_SERIAL = _resolve_adb_config()
 HEALTH_PACKAGE = "com.heytap.health"
 SUPPORTED_FIELDS = (
     "cycle_calendar", "weight_history", "sun_exposure", "wellness_home",
@@ -78,6 +110,22 @@ func legendSwatchSample(_ bitmap: NSBitmapImageRep, box: CGRect) -> [Int]? {
     return best
 }
 
+func dayCellSamples(
+    _ bitmap: NSBitmapImageRep, centerX: CGFloat, topY: CGFloat
+) -> [[Int]]? {
+    // Sample inside the date circle, away from the numeral glyph. Keeping the
+    // individual points lets the parser use a majority label when OCR bounds
+    // or a selected-day outline affect one sample.
+    let offsets: [(CGFloat, CGFloat)] = [
+        (-0.030, 0), (0.030, 0), (0, -0.022), (0, 0.022),
+        (-0.022, -0.016), (0.022, -0.016), (-0.022, 0.016), (0.022, 0.016),
+    ]
+    let samples = offsets.compactMap { dx, dy in
+        rgbSample(bitmap, x: centerX + dx, y: topY + dy)
+    }
+    return samples.count >= 5 ? samples : nil
+}
+
 let png = FileHandle.standardInput.readDataToEndOfFile()
 guard let bitmap = NSBitmapImageRep(data: png), let cgImage = bitmap.cgImage else {
     FileHandle.standardError.write(Data("image_decode_failed".utf8))
@@ -91,7 +139,7 @@ request.minimumTextHeight = 0.004
 let handler = VNImageRequestHandler(cgImage: cgImage)
 do {
     try handler.perform([request])
-    let observations = (request.results ?? []).compactMap { result -> [String: Any]? in
+    var observations = (request.results ?? []).compactMap { result -> [String: Any]? in
         let candidates = result.topCandidates(5).map { $0.string }
         guard let fallback = candidates.first else { return nil }
         let cycleLabels = ["Calendar", "Cycle", "Period", "Predicted period",
@@ -112,7 +160,7 @@ do {
         // Vision reports normalized boxes from the lower-left. NSBitmapImageRep
         // pixel coordinates use a top-left row origin, so convert before sampling.
         let topMidY = 1 - box.midY
-        let dayRGB = rgbSample(bitmap, x: box.midX, y: topMidY - 0.014)
+        let daySamples = dayCellSamples(bitmap, centerX: box.midX, topY: 1 - box.midY)
         let legendLabels = ["Period", "Predicted period", "Fertility window", "Ovulation"]
         let isLegendLabel = legendLabels.contains {
             $0.caseInsensitiveCompare(text.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
@@ -124,9 +172,28 @@ do {
             "text": text,
             "bbox": [box.origin.x, topY, box.width, box.height],
         ]
-        if let dayRGB { item["sample_rgb"] = dayRGB }
+        if let daySamples { item["sample_rgb_candidates"] = daySamples }
         if let legendRGB { item["legend_rgb"] = legendRGB }
         return item
+    }
+    var gridSamples: [Any]?
+    // The authorized emulator screenshot was verified at this 720x1280 layout.
+    // Restrict the color-grid fallback to that exact viewport; the parser also
+    // cross-checks these coordinates against its OCR weekday and date rows.
+    if cgImage.width == 720, cgImage.height == 1280 {
+        let weekdayCenters: [CGFloat] = [68, 165, 262, 359, 456, 553, 650].map { CGFloat($0) / 720 }
+        let rows: [CGFloat] = [472, 592, 712, 832, 952].map { CGFloat($0) / 1280 }
+        let cells = rows.map { rowY in
+            weekdayCenters.map { centerX in
+                dayCellSamples(bitmap, centerX: centerX, topY: rowY) ?? []
+            }
+        }
+        gridSamples = [["weekday_centers": weekdayCenters,
+                        "row_centers": rows,
+                        "sample_rgb_candidates": cells]]
+    }
+    if let gridSamples, let grid = gridSamples.first {
+        observations.append(["calendar_grid_samples": grid])
     }
     let payload: [String: Any] = [
         "width": cgImage.width,
@@ -371,6 +438,8 @@ def _capture(vision: Path) -> dict[str, Any]:
         "sun exposure", "mind and body", "avg wellness today", "active calories",
         "calories", "steps", "distance", "daily activity", "health", "all data",
         "health data", "health records", "see all", "view all",
+        "previous month", "last month", "prev month", "next month",
+        "上个月", "上月", "下个月", "下月",
         "体重", "历史体重", "待认领数据", "较上次持平", "记录体重", "公斤", "cancel", "取消",
     }
     if accessible_root is not None and width > 0 and height > 0:
@@ -487,6 +556,54 @@ def _tap_label(screen: dict[str, Any], candidates: tuple[str, ...]) -> dict[str,
     return found
 
 
+def _calendar_period_from_screen(screen: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Return the unique visible month heading and its OCR bounds."""
+    matches = []
+    for item in screen.get("observations", []):
+        text = item.get("text") if isinstance(item, dict) else None
+        bounds = item.get("bbox") if isinstance(item, dict) else None
+        if not isinstance(text, str) or not isinstance(bounds, list) or len(bounds) != 4:
+            continue
+        match = re.fullmatch(r"\s*(0?[1-9]|1[0-2])\s*[/.-]\s*(20\d{2})\s*", text)
+        if match:
+            matches.append((f"{int(match.group(2)):04d}-{int(match.group(1)):02d}", item))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _tap_calendar_month_arrow(
+    screen: dict[str, Any], direction: str, expected_period: str
+) -> str | None:
+    """Tap the visible unlabeled month arrow after verifying the calendar header."""
+    if direction not in {"previous", "next"} or not _is_cycle_calendar(screen):
+        return None
+    heading = _calendar_period_from_screen(screen)
+    if heading is None or heading[0] != expected_period:
+        return None
+
+    width, height = int(screen.get("width", 0)), int(screen.get("height", 0))
+    x, y, box_width, box_height = (float(part) for part in heading[1]["bbox"])
+    center_x, center_y = x + box_width / 2, y + box_height / 2
+    # These bounds identify the month selector row in the verified emulator UI.
+    # They keep the coordinate fallback away from dates and the Calendar/Cycle tabs.
+    if (
+        width < 600
+        or height < 900
+        or not 0.38 <= center_x <= 0.62
+        or not 0.18 <= center_y <= 0.29
+        or box_width <= 0
+        or box_height <= 0
+    ):
+        return None
+    target_x = int(round(width * (0.078 if direction == "previous" else 0.922)))
+    target_y = int(round(height * center_y))
+    if not (16 <= target_x < width - 16 and 16 <= target_y < height - 16):
+        return None
+    _assert_foreground()
+    _adb("shell", "input", "tap", str(target_x), str(target_y))
+    time.sleep(0.9)
+    return "visible_coordinate"
+
+
 def _back() -> None:
     _assert_foreground()
     _adb("shell", "input", "keyevent", "4")
@@ -583,10 +700,12 @@ def _page_has_detail_context(page: str, screen: dict[str, Any], title: str) -> b
             joined, re.IGNORECASE,
         ))
     if page == "wellness_home":
-        score = any(re.fullmatch(r"\d{1,3}", line) for line in lines)
-        category = bool(texts & {"excellent", "good", "moderate", "slow down"})
+        category = bool(texts & {
+            "excellent", "good", "moderate", "slow down",
+            "状态优秀", "状态不错", "状态正常", "适当放松",
+        }) or bool(re.search(r"(?:Excellent|Good|Moderate|Slow down|状态优秀|状态不错|状态正常|适当放松)", joined, re.IGNORECASE))
         point_time = any(re.fullmatch(r"\d{1,2}:[0-5]\d", line) for line in lines)
-        return score and (category or point_time)
+        return category or point_time
     if page == "wellness_detail":
         score = any(re.fullmatch(r"\d{1,3}", line) for line in lines)
         category = bool(re.search(r"\b(?:Excellent|Good|Moderate|Slow down)\b", joined, re.IGNORECASE))
@@ -674,6 +793,151 @@ def _parse(page: str, screen: dict[str, Any], *, observed_at: str, selected_date
     )
 
 
+_PREVIOUS_MONTH_LABELS = ("Previous month", "Last month", "Prev month", "上个月", "上月")
+_NEXT_MONTH_LABELS = ("Next month", "下个月", "下月")
+
+
+def _previous_month(period: str) -> str | None:
+    match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])", period)
+    if not match:
+        return None
+    year, month = (int(part) for part in match.groups())
+    if month == 1:
+        return f"{year - 1:04d}-12"
+    return f"{year:04d}-{month - 1:02d}"
+
+
+def _capture_calendar_month_pair(
+    screen: dict[str, Any],
+    *,
+    capture_screen: Any = None,
+    tap_label: Any = None,
+    tap_month_arrow: Any = None,
+    parse_page: Any = None,
+    observed_at: Any = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    """Read current and previous complete month, restoring the current view.
+
+    Navigation is allowed only through explicit visible/accessibility labels.
+    Missing controls, page mismatch, partial classification, or failed restore
+    leaves the adjacent boundary unknown. This helper has no storage writes.
+    """
+    if capture_screen is None or tap_label is None or parse_page is None:
+        raise ValueError("calendar navigation requires explicit injected capture operations")
+    observed_at = observed_at or (lambda: dt.datetime.now().astimezone().isoformat())
+    parse_failures: list[str] = []
+
+    def snapshot(candidate: dict[str, Any]) -> dict[str, Any] | None:
+        if not _is_cycle_calendar(candidate):
+            parse_failures.append("calendar_page_identity_unverified")
+            return None
+        try:
+            data = parse_page("cycle_calendar", candidate, observed_at=observed_at())
+        except (ValueError, TypeError, KeyError) as exc:
+            message = str(exc).casefold()
+            if "weekday" in message or "seven-column" in message:
+                parse_failures.append("weekday_header_unverified")
+            elif "row order" in message:
+                parse_failures.append("calendar_row_order_unverified")
+            elif "did not cover enough dates" in message:
+                parse_failures.append("calendar_ocr_coverage_insufficient")
+            elif "row" in message or "coverage" in message or "date labels" in message or "dates" in message:
+                parse_failures.append("calendar_day_grid_incomplete")
+            elif "legend" in message or "color" in message or "colour" in message:
+                parse_failures.append("legend_color_unverified")
+            elif "month" in message or "year" in message:
+                parse_failures.append("calendar_month_heading_unverified")
+            else:
+                parse_failures.append("calendar_parse_rejected")
+            return None
+        return {"status": _status("cycle_calendar", data), "data": data}
+
+    current_item = snapshot(screen)
+    if current_item is None:
+        return screen, [], {"status": "current_unverified", "reason": "current_month_unverified"}
+    current_period = current_item["data"].get("period")
+    previous_period = _previous_month(current_period) if isinstance(current_period, str) else None
+    snapshots = [current_item]
+    if previous_period is None:
+        return screen, snapshots, {"status": "previous_unavailable", "reason": "current_month_label_invalid"}
+    def tap_month(
+        candidate: dict[str, Any], direction: str, expected_period: str
+    ) -> str | None:
+        labels = _PREVIOUS_MONTH_LABELS if direction == "previous" else _NEXT_MONTH_LABELS
+        if tap_label(candidate, labels) is not None:
+            return "accessibility_label"
+        if callable(tap_month_arrow):
+            return tap_month_arrow(candidate, direction, expected_period)
+        return None
+
+    previous_tap = tap_month(screen, "previous", current_period)
+    if previous_tap is None:
+        return screen, snapshots, {"status": "previous_unavailable", "reason": "previous_month_control_unavailable"}
+
+    previous_screen = capture_screen()
+    previous_item = snapshot(previous_screen)
+    if previous_item is None:
+        time.sleep(0.4)
+        previous_screen = capture_screen()
+        previous_item = snapshot(previous_screen)
+    if (
+        previous_item is not None
+        and previous_item["data"].get("period") == current_period
+    ):
+        # A bounded second tap is safe only after capture verifies that the
+        # page never left the original month.
+        retry = tap_month(screen, "previous", current_period)
+        if retry is not None:
+            previous_tap = f"{previous_tap}_retry"
+            previous_screen = capture_screen()
+            previous_item = snapshot(previous_screen)
+    if previous_item is None or previous_item["data"].get("period") != previous_period:
+        # Best-effort restore is still mandatory after any navigation action.
+        restored = None
+        visible = _calendar_period_from_screen(previous_screen)
+        previous_heading_matches_expected = bool(
+            visible and visible[0] == previous_period
+        )
+        if visible and visible[0] == current_period:
+            restored = previous_screen
+        elif visible and tap_month(previous_screen, "next", visible[0]) is not None:
+            restored = capture_screen()
+        if restored is not None and _is_cycle_calendar(restored):
+            return restored, snapshots, {
+                "status": "previous_unverified",
+                "reason": (
+                    "previous_month_parse_failed"
+                    if previous_item is None and previous_heading_matches_expected
+                    else "previous_month_mismatch"
+                ),
+                "previous_page_parsed": previous_item is not None,
+                "previous_heading_matches_expected": previous_heading_matches_expected,
+                "previous_parse_reason": parse_failures[-1] if parse_failures else None,
+            }
+        return screen, snapshots, {"status": "restore_failed", "reason": "calendar_restore_unverified"}
+
+    snapshots.insert(0, previous_item)
+    # The previous month is now the visible page; resolve its control before
+    # tapping so the month identity check below can verify restoration.
+    screen = previous_screen
+    next_tap = tap_month(previous_screen, "next", previous_period)
+    if next_tap is None:
+        return screen, snapshots, {"status": "restore_failed", "reason": "next_month_control_unavailable"}
+    restored = capture_screen()
+    restored_item = snapshot(restored)
+    if restored_item is None or restored_item["data"].get("period") != current_period:
+        return restored if isinstance(restored, dict) else screen, snapshots, {
+            "status": "restore_failed", "reason": "current_month_restore_unverified"
+        }
+    methods = {previous_tap, next_tap}
+    method = next(iter(methods)) if len(methods) == 1 else "mixed"
+    return restored, snapshots, {
+        "status": "complete",
+        "reason": "previous_and_current_month_verified",
+        "navigation_method": method,
+    }
+
+
 def _capture_field(field: str, screen: dict[str, Any], vision: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Navigate only through visible labels and capture one requested page."""
     home = _go_home(screen, vision, max_back=2 if field == "weight_history" else 1)
@@ -708,6 +972,15 @@ def _capture_field(field: str, screen: dict[str, Any], vision: Path) -> tuple[di
         target = _capture(vision)
         if not _is_cycle_calendar(target):
             return None, _go_home(target, vision)
+        target, month_pages, navigation = _capture_calendar_month_pair(
+            target,
+            capture_screen=lambda: _capture(vision),
+            tap_label=_tap_label,
+            tap_month_arrow=_tap_calendar_month_arrow,
+            parse_page=_parse,
+        )
+        target["_cycle_calendar_months"] = month_pages
+        target["_period_calendar_navigation"] = navigation
     elif field == "weight_history":
         date_observation = next((
             item for item in target.get("observations", [])
@@ -832,7 +1105,11 @@ def collect(fields: list[str], *, labels_only: bool = False) -> dict[str, Any]:
         if not ADB or not Path(ADB).is_file() or not re.fullmatch(r"emulator-\d+", ADB_SERIAL):
             return {"status": "unavailable", "reason": "local_capture_not_configured", "pages": {}}
         _assert_foreground(force=True)
-    except (CaptureError, OSError, subprocess.TimeoutExpired):
+    except CaptureError as exc:
+        # Keep the app-state guard distinct from an ADB transport failure.
+        # This makes a backgrounded app diagnosable without retrying capture.
+        return {"status": "unavailable", "reason": str(exc), "pages": {}}
+    except (OSError, subprocess.TimeoutExpired):
         return {"status": "unavailable", "reason": "adb_unavailable", "pages": {}}
 
     pages: dict[str, Any] = {}
@@ -881,6 +1158,13 @@ def collect(fields: list[str], *, labels_only: bool = False) -> dict[str, Any]:
                 try:
                     data = _parse(field, page_screen, observed_at=stamp, selected_date=selected_date)
                     pages[field] = {"status": _status(field, data), "data": data}
+                    if field == "cycle_calendar":
+                        month_pages = page_screen.get("_cycle_calendar_months")
+                        navigation = page_screen.get("_period_calendar_navigation")
+                        if isinstance(month_pages, list):
+                            pages["cycle_calendar_months"] = month_pages
+                        if isinstance(navigation, dict):
+                            pages["period_calendar_navigation"] = navigation
                 except (ValueError, TypeError) as exc:
                     pages[field] = {"status": "page_unverified", "reason": str(exc)}
                 current = home or current
@@ -895,8 +1179,10 @@ def collect(fields: list[str], *, labels_only: bool = False) -> dict[str, Any]:
                         _capture(vision)
             status = "ok" if any(value.get("data") for value in pages.values()) else "unavailable"
             return {"status": status, "reason": None if status == "ok" else "no_page_verified", "pages": pages}
-    except (CaptureError, OSError, subprocess.TimeoutExpired):
-        return {"status": "unavailable", "reason": "local_capture_unavailable", "pages": pages}
+    except CaptureError as exc:
+        return {"status": "unavailable", "reason": str(exc), "pages": pages}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__, "pages": pages}
 
 
 def main() -> None:

@@ -5,10 +5,11 @@
 const ruleDefinitions = [
   { id: "predicted_period_lead", name: "预测经期提前提醒", description: "仅按 OPPO 预测日期，在预计开始前 D-3、D-2、D-1 每天关怀一次；这是预测，不代表已开始。", leadDays: 3 },
   { id: "confirmed_period_start", name: "已记录经期开始", description: "本人在 OPPO 记录开始后，D1、D2、D3 每天关怀一次；不代替本人记录。" },
-  { id: "confirmed_period_end", name: "已记录经期结束", description: "只对 OPPO 明确记录的实际结束事件关怀一次；来源没有结束事件时暂停并显示原因。" },
-  { id: "period_late_inquiry", name: "经期后段随机询问", description: "从明确开始记录后的 D4 起，每个合格日按概率随机询问一次是否已结束；仅在 OPPO 明确结束记录前、配置观察窗内运行。不会因本人回答而替她修改 OPPO 记录。" },
+  { id: "confirmed_period_end", name: "本人确认经期结束", description: "本人在目标私聊确认后只读同步完整 Calendar 实际日期簇；不会写入 OPPO。" },
+  { id: "post_period_care", name: "经期结束后关怀", description: "本人确认且确认后的只读同步可证明实际日期簇末日后，每个周期最多安排一次。" },
+  { id: "period_late_inquiry", name: "经期结束确认询问", description: "实际经期第 6、7、8 天每天最多问一次；只接受目标私聊中的明确短肯定回复。" },
   { id: "weight_date_linked", name: "减肥模式下的体重观察", description: "只由本人私聊明确说“我想减肥/我要减肥”开启；“我不减肥”关闭。仅观察开启后实际测量的新记录，不读取体重数值。" },
-  { id: "wellness_low_state", name: "持续低状态关怀", description: "分值越高越好。可按 Slow down 分类或待确认的数值阈值；持续低时每周平均约 5 个随机时段，有新样本且间隔满足时同一持续阶段也可多次关怀。" },
+  { id: "wellness_low_state", name: "持续低状态关怀", description: "只在 OPPO 类别为“适当放松”（英文 Slow down）时判断持续低状态；“状态正常”不触发，也不读取状态分数或推断疾病。每条新的合格测量时间点独立抽样，以持续处于合格状态时平均每周约 5 次为目标；没有合格新样本时少于 5 次，冷却后同一天仍可再次抽样。本人主动查询不计入。" },
   { id: "sunlight_evening", name: "日照记录关怀", description: "每天 20:00–21:00 随机检查；当天真实记录为 0–5 分钟（含边界）才关怀一次，超过 5 跳过，缺失不按 0。" },
 ];
 
@@ -49,9 +50,21 @@ function setDirty(message = "设置有未保存的更改") {
 function renderData() {
   const sources = pageState?.data_sources || [];
   if (!sources.length) {
-    byId("data-grid").innerHTML = '<article class="data-card"><div class="data-top"><span class="data-name">来源状态</span><span class="state-badge missing">暂不可用</span></div><p class="data-value">尚未连接健康数据来源</p><p class="data-meta">没有可显示的日期或数值</p></article>';
+    byId("data-grid").innerHTML = '<article class="data-card"><div class="data-top"><span class="data-name">来源状态</span><span class="state-badge missing">状态未知</span></div><p class="data-value">当前没有来源状态返回；不能据此判断是否有记录。</p></article>';
     return;
   }
+  const collectionLabels = {
+    rule_disabled: "规则关闭，未采集",
+    rule_disabled_shared_capture: "规则关闭，不用于本规则",
+    not_collected: "规则已开，但本次未采集",
+    consent_required: "等待本人明确授权",
+    collection_failed: "本次采集未完成",
+    no_records: "已读取，未发现所需记录",
+    filtered: "存在记录，但被规则筛选",
+    evidence_unavailable: "有日历标记，缺少明确事件证据",
+    configuration_required: "等待确认规则参数",
+    usable: "有可用于规则的记录",
+  };
   const statusLabels = {
     ok: "可用",
     unavailable: "暂不可用",
@@ -61,15 +74,21 @@ function renderData() {
     error: "读取异常",
   };
   byId("data-grid").innerHTML = sources.map((item) => {
-    const status = item.is_stale === true ? "已过期" : (statusLabels[item.status] || "暂不可用");
+    const status = collectionLabels[item.collection_state]
+      || (item.is_stale === true ? "已过期" : (statusLabels[item.status] || "暂不可用"));
     const badgeClass = item.is_stale === true || item.status === "stale" ? "stale" : (item.status === "ok" ? "fresh" : "missing");
     const date = item.data_date ? `<p class="data-meta">数据日期：<strong>${esc(item.data_date)}</strong></p>` : '<p class="data-meta">数据日期：暂无</p>';
     const measured = item.measured_at ? `<p class="data-meta">测量时间：${esc(item.measured_at)}</p>` : "";
     const observed = item.observed_at ? `<p class="data-meta">读取时间：${esc(prettyTime(item.observed_at))}</p>` : "";
-    const labels = [item.category ? `分类：${item.category}` : "", item.quality ? `质量：${item.quality}` : "", item.completeness ? `完整性：${item.completeness}` : ""].filter(Boolean);
+    const categoryNames = {
+      Excellent: "状态优秀", Good: "状态不错", Moderate: "状态正常", "Slow down": "适当放松",
+      状态优秀: "状态优秀", 状态不错: "状态不错", 状态正常: "状态正常", 适当放松: "适当放松",
+    };
+    const category = item.category ? `分类：${categoryNames[item.category] || item.category}` : "";
+    const labels = [category, item.quality ? `质量：${item.quality}` : "", item.completeness ? `完整性：${item.completeness}` : ""].filter(Boolean);
     return `<article class="data-card">
       <div class="data-top"><span class="data-name">${esc(item.name || item.source)}</span><span class="state-badge ${badgeClass}">${esc(status)}</span></div>
-      <p class="data-value">${esc(item.reason || (item.status === "ok" ? "来源记录可用" : "没有可用于规则的记录"))}</p>
+      <p class="data-value">${esc(item.reason || (item.collection_state === "no_records" ? "页面读取成功，但没有该规则需要的记录。" : item.collection_state === "filtered" ? "已有来源记录，但日期、时间或授权条件未通过。" : item.collection_state === "rule_disabled" ? "规则关闭，因此没有为此规则采集来源。" : item.collection_state === "rule_disabled_shared_capture" ? "规则关闭；即使共享页面因其他规则读取，也不会用于此规则。" : item.status === "ok" ? "来源记录可用。" : "当前状态不足以判断是否存在记录。"))}</p>
       ${date}${measured}${observed}${labels.map((label) => `<p class="data-meta">${esc(label)}</p>`).join("")}
     </article>`;
   }).join("");
@@ -102,16 +121,17 @@ function renderRules() {
       ? field(`${definition.id}-lead_days`, "固定提前阶段", `<output id="${definition.id}-lead_days" class="read-only-value">D-3、D-2、D-1</output>`, "每天最多一次；此阶段不可调为别的天数。")
       : "";
     const wellnessControls = definition.id === "wellness_low_state" ? `
-      ${field(`${definition.id}-mode`, "低值判定方式", `<select id="${definition.id}-mode" data-rule="${definition.id}" data-path="mode"><option value="unconfirmed" ${rule.mode === "unconfirmed" ? "selected" : ""}>尚未确认</option><option value="numeric" ${rule.mode === "numeric" ? "selected" : ""}>数值低值阈值</option><option value="slow_down_category" ${rule.mode === "slow_down_category" ? "selected" : ""}>只按 Slow down 分类</option></select>`, "分类方案不设分值顺序，只在来源明确显示 Slow down 时判为低；恢复按离开该分类并完成去抖。")}
+      ${field(`${definition.id}-mode`, "低状态判定方式", `<select id="${definition.id}-mode" data-rule="${definition.id}" data-path="mode"><option value="unconfirmed" ${rule.mode === "unconfirmed" ? "selected" : ""}>尚未确认</option><option value="numeric" ${rule.mode === "numeric" ? "selected" : ""}>按分数阈值</option><option value="slow_down_category" ${rule.mode === "slow_down_category" ? "selected" : ""}>只按“适当放松”类别</option></select>`, "类别方案只认 OPPO 显示的“适当放松”（英文 Slow down）；“状态正常”不触发。类别方案不读取或比较分数；离开“适当放松”并完成恢复去抖后视为恢复。")}
+      ${field(`${definition.id}-daily-cap`, "每日主动关怀上限", '<output class="read-only-value">不设每日硬上限</output>', "每周目标是平均频率，不是固定 5 个日期；同一持续状态须等冷却结束并出现新测量点后才可能再次关怀。")}
       ${field(`${definition.id}-tz-confirmed`, "设备时区已核实", `<input id="${definition.id}-tz-confirmed" type="checkbox" data-rule="${definition.id}" data-path="timezone_confirmed" ${rule.timezone_confirmed ? "checked" : ""} />`, "状态来源没有写明设备时区；未勾选时不会解释测量时间。")}
-      ${field(`${definition.id}-low`, "低值阈值（数值方案）", `<input id="${definition.id}-low" type="number" min="0" max="999" step="1" data-nullable="true" data-rule="${definition.id}" data-path="low_score_threshold" value="${rule.low_score_threshold ?? ""}" />`, "留空不会触发；当前没有确认官方分值范围。")}
-      ${field(`${definition.id}-recovery`, "恢复阈值（数值方案）", `<input id="${definition.id}-recovery" type="number" min="0" max="999" step="1" data-nullable="true" data-rule="${definition.id}" data-path="recovery_score_threshold" value="${rule.recovery_score_threshold ?? ""}" />`, "需高于低值阈值。")}
-      ${field(`${definition.id}-confirmation`, "持续低值时长（分钟）", `<input id="${definition.id}-confirmation" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="confirmation_minutes" value="${rule.confirmation_minutes ?? ""}" />`)}
-      ${field(`${definition.id}-samples`, "最少独立样本数", `<input id="${definition.id}-samples" type="number" min="2" max="100" step="1" data-nullable="true" data-rule="${definition.id}" data-path="minimum_independent_samples" value="${rule.minimum_independent_samples ?? ""}" />`, "同一测量时间重复轮询不会增加样本数。")}
-      ${field(`${definition.id}-recovery-delay`, "恢复去抖（分钟）", `<input id="${definition.id}-recovery-delay" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="recovery_debounce_minutes" value="${rule.recovery_debounce_minutes ?? ""}" />`)}
-      ${field(`${definition.id}-sample-age`, "样本最长年龄（分钟）", `<input id="${definition.id}-sample-age" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="maximum_sample_age_minutes" value="${rule.maximum_sample_age_minutes ?? ""}" />`, "同时限制相邻样本间隔。")}
-      ${field(`${definition.id}-cooldown`, "同一持续低状态的重复关怀最短间隔（分钟）", `<input id="${definition.id}-cooldown" type="number" min="1" max="10080" step="1" data-nullable="true" data-rule="${definition.id}" data-path="repeat_cooldown_minutes" value="${rule.repeat_cooldown_minutes ?? ""}" />`, "同一段状态可再次关怀，但须有新的有效测量并达到此间隔。")}
-      ${field(`${definition.id}-weekly`, "每周随机时段目标", `<input id="${definition.id}-weekly" type="number" min="1" max="7" step="1" data-rule="${definition.id}" data-path="weekly_target" value="${rule.weekly_target}" />`, "默认约 5 个随机候选时段；没有符合条件的新样本时跳过，不补满。")}
+      ${field(`${definition.id}-low`, "低值阈值（仅数值方案）", `<input id="${definition.id}-low" type="number" min="0" max="999" step="1" data-nullable="true" data-rule="${definition.id}" data-path="low_score_threshold" value="${rule.low_score_threshold ?? ""}" />`, "类别方案不使用分数阈值；数值方案仅在确认官方分值范围后填写。")}
+      ${field(`${definition.id}-recovery`, "恢复阈值（仅数值方案）", `<input id="${definition.id}-recovery" type="number" min="0" max="999" step="1" data-nullable="true" data-rule="${definition.id}" data-path="recovery_score_threshold" value="${rule.recovery_score_threshold ?? ""}" />`, "类别方案不使用分数阈值；数值方案的恢复阈值需高于低值阈值。")}
+      ${field(`${definition.id}-confirmation`, "持续低状态时长（分钟）", `<input id="${definition.id}-confirmation" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="confirmation_minutes" value="${rule.confirmation_minutes ?? ""}" placeholder="30" />`, "产品去抖建议：30 分钟；不是医疗判断。")}
+      ${field(`${definition.id}-samples`, "最少独立测量时间点", `<input id="${definition.id}-samples" type="number" min="2" max="100" step="1" data-nullable="true" data-rule="${definition.id}" data-path="minimum_independent_samples" value="${rule.minimum_independent_samples ?? ""}" placeholder="3" />`, "建议至少 3 个不同测量时间；同一点重复轮询不会增加样本数。")}
+      ${field(`${definition.id}-recovery-delay`, "恢复去抖（分钟）", `<input id="${definition.id}-recovery-delay" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="recovery_debounce_minutes" value="${rule.recovery_debounce_minutes ?? ""}" placeholder="15" />`, "建议 15 分钟且需要两个不同恢复测量点。")}
+      ${field(`${definition.id}-sample-age`, "最新样本最长年龄（分钟）", `<input id="${definition.id}-sample-age" type="number" min="1" max="1440" step="1" data-nullable="true" data-rule="${definition.id}" data-path="maximum_sample_age_minutes" value="${rule.maximum_sample_age_minutes ?? ""}" placeholder="30" />`, "建议 30 分钟；相同测量时间不会重复计数。")}
+      ${field(`${definition.id}-cooldown`, "同一持续低状态关怀冷却（分钟）", `<input id="${definition.id}-cooldown" type="number" min="1" max="10080" step="1" data-nullable="true" data-rule="${definition.id}" data-path="repeat_cooldown_minutes" value="${rule.repeat_cooldown_minutes ?? ""}" placeholder="240" />`, "建议 4 小时；再次关怀仍须有新的低状态测量点。")}
+      ${field(`${definition.id}-weekly`, "平均每周关怀目标", `<input id="${definition.id}-weekly" type="number" min="1" max="7" step="1" data-rule="${definition.id}" data-path="weekly_target" value="${rule.weekly_target}" />`, "按持续合格状态的活跃发送时段与冷却间隔校准概率；目标是长期平均值，不保证每周固定次数。只有新鲜、不同的测量时间点参加抽样。")}
     ` : "";
     const latePeriodControls = definition.id === "period_late_inquiry" ? `
       ${field(`${definition.id}-start-day`, "后段询问起始日", `<input id="${definition.id}-start-day" type="number" min="4" max="30" step="1" data-rule="${definition.id}" data-path="start_day" value="${rule.start_day}" />`, "默认 D4；与 D1–D3 每日关怀互斥。")}
@@ -320,19 +340,17 @@ function validateConfigClient(candidate) {
       throw new Error(`${name}：提醒阶段固定为 D-3、D-2、D-1。`);
     }
     if (id === "period_late_inquiry") {
-      if (!Number.isInteger(rule.start_day) || rule.start_day < 4 || rule.start_day > 30) {
-        throw new Error(`${name}：询问起始日需在 D4 至 D30。`);
+      if (rule.start_day !== 6) {
+        throw new Error(`${name}：首次询问固定为 D6。`);
       }
-      if (typeof rule.probability !== "number" || !Number.isFinite(rule.probability)
-          || rule.probability < 0 || rule.probability > 1) {
-        throw new Error(`${name}：每日随机概率需在 0 至 1。`);
+      if (rule.probability !== 1) {
+        throw new Error(`${name}：D6–D8 每日询问固定启用。`);
       }
       if (!Number.isInteger(rule.cooldown_days) || rule.cooldown_days < 1 || rule.cooldown_days > 30) {
         throw new Error(`${name}：冷却天数需在 1 至 30。`);
       }
-      if (!Number.isInteger(rule.observation_window_days)
-          || rule.observation_window_days < rule.start_day || rule.observation_window_days > 60) {
-        throw new Error(`${name}：观察窗需不短于起始日且不超过 60 天。`);
+      if (rule.observation_window_days !== 8) {
+        throw new Error(`${name}：询问窗口固定为 D6–D8。`);
       }
     }
     if (id === "sunlight_evening"

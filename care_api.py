@@ -18,6 +18,7 @@ _RULE_NAMES = {
     "predicted_period_lead": "预测经期提前提醒",
     "confirmed_period_start": "已确认经期开始",
     "confirmed_period_end": "已确认经期结束",
+    "post_period_care": "经期结束后关怀",
     "period_late_inquiry": "经期后段随机询问",
     "weight_date_linked": "体重按记录日期联动",
     "wellness_low_state": "身心状态值持续偏低关怀",
@@ -27,6 +28,7 @@ _SOURCE_NAMES = {
     "predicted_period": "经期预测",
     "confirmed_period_start": "经期开始确认",
     "confirmed_period_end": "经期结束确认",
+    "post_period_care": "经期后关怀",
     "period_late_inquiry": "经期后段询问",
     "weight_entry": "体重记录",
     "wellness_low_state": "身心状态值",
@@ -36,10 +38,16 @@ _RULE_SOURCES = {
     "predicted_period_lead": "predicted_period",
     "confirmed_period_start": "confirmed_period_start",
     "confirmed_period_end": "confirmed_period_end",
+    "post_period_care": "post_period_care",
     "period_late_inquiry": "period_late_inquiry",
     "weight_date_linked": "weight_entry",
     "wellness_low_state": "wellness_low_state",
     "sunlight_evening": "sunlight_evening",
+}
+_SOURCE_RULES = {source: rule for rule, source in _RULE_SOURCES.items()}
+_COLLECTION_STATES = {
+    "rule_disabled", "rule_disabled_shared_capture", "not_collected", "consent_required", "collection_failed",
+    "no_records", "filtered", "evidence_unavailable", "configuration_required", "usable",
 }
 
 
@@ -151,6 +159,12 @@ class CarePageAPI:
                     "source": source,
                     "name": _SOURCE_NAMES[source],
                     "status": status,
+                    "collection_state": (
+                        item.get("collection_state")
+                        if isinstance(item.get("collection_state"), str)
+                        and item.get("collection_state") in _COLLECTION_STATES
+                        else None
+                    ),
                     "data_date": data_date if isinstance(data_date, str) and len(data_date) <= 32 else None,
                     "observed_at": observed_at if isinstance(observed_at, str) and len(observed_at) <= 64 else None,
                     "is_stale": item.get("is_stale") if isinstance(item.get("is_stale"), bool) else None,
@@ -245,8 +259,9 @@ class CarePageAPI:
             }
             for item in persisted["attempts"][-10:]
         ]
-        data_sources = [
-            sources_by_id.get(source, {
+        data_sources = []
+        for source, name in _SOURCE_NAMES.items():
+            source_status = dict(sources_by_id.get(source, {
                 "source": source,
                 "name": name,
                 "status": "not_configured",
@@ -254,9 +269,20 @@ class CarePageAPI:
                 "observed_at": None,
                 "is_stale": None,
                 "reason": None,
-            })
-            for source, name in _SOURCE_NAMES.items()
-        ]
+            }))
+            if source_status.get("collection_state") not in _COLLECTION_STATES:
+                rule_id = _SOURCE_RULES[source]
+                rule = config["rules"].get(rule_id, {})
+                if source == "weight_entry" and rule.get("enabled") and not runtime_policy.get("weight_mode_enabled"):
+                    source_status["collection_state"] = "consent_required"
+                    source_status["reason"] = "体重事实查询与自动关怀分开；自动关怀需本人明确开启减肥模式"
+                elif not rule.get("enabled"):
+                    source_status["collection_state"] = "rule_disabled"
+                    source_status["reason"] = "规则关闭，未为该规则采集来源"
+                else:
+                    source_status["collection_state"] = "collection_failed"
+                    source_status["reason"] = source_status.get("reason") or "规则已开启，但本次来源未读取成功"
+            data_sources.append(source_status)
         return json_response({
             "schema_version": 1,
             "demo": False,
@@ -284,7 +310,7 @@ class CarePageAPI:
                     "name": "本人减肥模式",
                     "enabled": runtime_policy.get("weight_mode_enabled") is True,
                     "state": "enabled" if runtime_policy.get("weight_mode_enabled") is True else "disabled",
-                    "reason": "只由本人私聊明确说“我想减肥/我要减肥”开启；“我不减肥”关闭；仅处理开启后实际测量的新记录",
+                    "reason": "体重事实查询与减肥自动关怀分开；自动关怀只由本人明确表达减肥意愿后开启，且只处理开启后的新测量记录",
                 },
             ],
             "data_sources": data_sources,

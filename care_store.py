@@ -17,6 +17,8 @@ _V03_RULE_IDS = {
     "weight_date_linked",
 }
 _PRE_LATE_PERIOD_RULE_IDS = set(RULE_IDS) - {"period_late_inquiry"}
+_PRE_POST_PERIOD_RULE_IDS = set(RULE_IDS) - {"post_period_care"}
+_PRE_LATE_AND_POST_PERIOD_RULE_IDS = set(RULE_IDS) - {"period_late_inquiry", "post_period_care"}
 
 
 def _upgrade_v03_config(value: object) -> object:
@@ -39,6 +41,8 @@ def _upgrade_v03_config(value: object) -> object:
     if (set(rules) in (
             set(RULE_IDS),
             _PRE_LATE_PERIOD_RULE_IDS,
+            _PRE_POST_PERIOD_RULE_IDS,
+            _PRE_LATE_AND_POST_PERIOD_RULE_IDS,
         )
             and set(value) in ({"schema_version", "rules"}, {"schema_version", "rules", "health_budget"})):
         # A previous local candidate offered a cross-category daily cap. The
@@ -54,6 +58,15 @@ def _upgrade_v03_config(value: object) -> object:
                 rule["reschedule"] = "skip_if_late"
                 if rule_id == "sunlight_evening":
                     rule["send_window"] = {"start": "20:00", "end": "21:00"}
+        period_inquiry = upgraded_rules.get("period_late_inquiry")
+        if isinstance(period_inquiry, dict):
+            # These fields are fixed by the current D6–D8 inquiry contract.
+            # Canonicalize legacy values without changing the rule's opt-in or cooldown.
+            period_inquiry.update(
+                start_day=6,
+                probability=1.0,
+                observation_window_days=8,
+            )
         wellness = upgraded_rules.get("wellness_low_state")
         if isinstance(wellness, dict):
             mode = wellness.get("mode")
@@ -130,7 +143,8 @@ def _validate_scheduler_state(value: object) -> dict[str, Any]:
         if (not isinstance(attempt, dict) or set(attempt) - allowed_attempt_fields
                 or attempt.get("rule_id") not in RULE_IDS
                 or attempt.get("outcome") not in {
-                    "dispatching", "handed_off", "failed", "failed_uncertain", "skipped"
+                    "dispatching", "handed_off", "failed", "failed_uncertain", "skipped",
+                    "refresh_deferred",
                 }
                 or not isinstance(attempt.get("at"), str)
                 or len(attempt["at"]) > 64
@@ -157,6 +171,7 @@ class CareRepository:
         self.config_path = self.directory / "care-rules.json"
         self.state_path = self.directory / "scheduler-state.json"
         self.wellness_state_path = self.directory / "wellness-runtime.json"
+        self.period_state_path = self.directory / "period-runtime.json"
 
     def _ensure_directory(self) -> None:
         try:
@@ -290,3 +305,27 @@ class CareRepository:
             raise CareStorageError("wellness runtime state is invalid") from exc
         with self._lock:
             self._atomic_write(self.wellness_state_path, normalized)
+
+    def load_period_state(self) -> dict[str, Any]:
+        """Load score-free local inquiry/confirmation metadata."""
+        from .period_runtime import empty_period_state, validate_period_state
+
+        with self._lock:
+            raw = self._read_json(self.period_state_path)
+            if raw is None:
+                return empty_period_state()
+            try:
+                return validate_period_state(raw)
+            except (ValueError, TypeError) as exc:
+                raise CareStorageError("period runtime state is invalid") from exc
+
+    def save_period_state(self, state: object) -> None:
+        """Persist allowlisted period identifiers and timestamps atomically."""
+        from .period_runtime import validate_period_state
+
+        try:
+            normalized = validate_period_state(state)
+        except (ValueError, TypeError) as exc:
+            raise CareStorageError("period runtime state is invalid") from exc
+        with self._lock:
+            self._atomic_write(self.period_state_path, normalized)

@@ -21,6 +21,7 @@ _SOURCE_BY_RULE = {
     "predicted_period_lead": "predicted_period",
     "confirmed_period_start": "confirmed_period_start",
     "confirmed_period_end": "confirmed_period_end",
+    "post_period_care": "post_period_care",
     "period_late_inquiry": "period_late_inquiry",
     "weight_date_linked": "weight_entry",
     "wellness_low_state": "wellness_low_state",
@@ -399,6 +400,13 @@ def _counted_today(state: dict[str, Any], rule_id: str, now: datetime, timezone_
     return count
 
 
+def _daily_cap_reached(state: dict[str, Any], rule_id: str, now: datetime, rule: dict[str, Any]) -> bool:
+    """Apply fixed daily caps except to wellness, which uses cooldown sampling."""
+    if rule_id == "wellness_low_state":
+        return False
+    return _counted_today(state, rule_id, now, rule["timezone"]) >= rule["max_per_day"]
+
+
 def dispatch_due(
     config: object,
     event_facts: object,
@@ -438,7 +446,7 @@ def dispatch_due(
     results.extend(skipped)
     for job_id, job in due_jobs:
         rule = validated["rules"][job["rule_id"]]
-        if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
+        if _daily_cap_reached(state, job["rule_id"], now, rule):
             reason = "已达到这条规则的每日提醒上限"
             job.update(state="skipped", reason=reason, updated_at=now.isoformat())
             _append_attempt(state, {
@@ -539,7 +547,7 @@ async def dispatch_due_async(
         for job_id, job in due_jobs:
             rule = validated["rules"][job["rule_id"]]
             reason = None
-            if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
+            if _daily_cap_reached(state, job["rule_id"], now, rule):
                 reason = "已达到这条规则的每日提醒上限"
             else:
                 reason = _is_duplicate(state, job, rule, now)
@@ -597,12 +605,18 @@ async def dispatch_due_async(
                 elif isinstance(outcome, dict) and outcome.get("outcome") == "failed":
                     outcome_name = "failed"
                     reason = "本人私聊回复流程拒绝了合并关怀"
+                elif isinstance(outcome, dict) and outcome.get("outcome") == "deferred":
+                    outcome_name = "pending"
+                    reason = "新鲜来源暂不可用；保留机会等待下一次合法检查"
                 else:
                     outcome_name = "handed_off"
                     reason = "合并关怀已交给 AstrBot 私聊回复流程；平台送达状态未确认"
             for job_id, job, _rule in eligible:
                 job.update(state=outcome_name, reason=reason, updated_at=now.isoformat())
-                attempts_by_job[job_id].update(outcome=outcome_name, reason=reason)
+                attempts_by_job[job_id].update(
+                    outcome="refresh_deferred" if outcome_name == "pending" else outcome_name,
+                    reason=reason,
+                )
                 results.append({"job_id": job_id, "outcome": outcome_name, "reason": reason})
             if persist is not None:
                 persist(deepcopy(state))
@@ -610,7 +624,7 @@ async def dispatch_due_async(
 
     for job_id, job in due_jobs:
         rule = validated["rules"][job["rule_id"]]
-        if _counted_today(state, job["rule_id"], now, rule["timezone"]) >= rule["max_per_day"]:
+        if _daily_cap_reached(state, job["rule_id"], now, rule):
             reason = "已达到这条规则的每日提醒上限"
             job.update(state="skipped", reason=reason, updated_at=now.isoformat())
             attempt = {

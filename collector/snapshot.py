@@ -23,9 +23,10 @@ def measured_at(value):
         return None
 
 
-def summarize(metric, rows, date):
+def summarize(metric, rows, date, now=None):
     bounds = day_range(date)
     start, end = bounds['startTimestamp'], bounds['endTimestamp']
+    now = now or dt.datetime.now(TZ)
     if metric == 'steps':
         unique = {}
         for row in rows:
@@ -54,16 +55,33 @@ def summarize(metric, rows, date):
         latest = max(valid, key=lambda r: r['dataCreatedTimestamp'])
         result = {'latest': latest[value_key], 'measured_at': measured_at(latest['dataCreatedTimestamp'])}
         if metric == 'heart_rate' and resting:
-            result['resting'] = max(resting, key=lambda r: r['dataCreatedTimestamp'])[value_key]
+            latest_resting = max(resting, key=lambda r: r['dataCreatedTimestamp'])
+            result['resting'] = latest_resting[value_key]
+            result['resting_measured_at'] = measured_at(latest_resting['dataCreatedTimestamp'])
         return result
     if metric == 'sleep':
         dates = {date.isoformat(), date.strftime('%Y%m%d')}
-        valid = [r for r in rows if str(r.get('date')) in dates
-                 and number(r.get('totalSleepTime')) is not None and r['totalSleepTime'] > 0]
-        if not valid:
+        completed = []
+        now_ms = now.timestamp() * 1000
+        for row in rows:
+            if (str(row.get('date')) not in dates
+                    or number(row.get('totalSleepTime')) is None
+                    or row['totalSleepTime'] <= 0):
+                continue
+            main = row.get('sleepMainData') or row
+            sleep_in = number(main.get('sleepInTime'))
+            sleep_out = number(main.get('sleepOutTime'))
+            modified = number(row.get('modifiedTimestamp')) or 0
+            if (sleep_in is None or sleep_out is None or sleep_in >= sleep_out
+                    or not start <= sleep_out <= end or sleep_out > now_ms):
+                continue
+            completed.append((sleep_out, modified, row, main))
+        if not completed:
             return None
-        row = max(valid, key=lambda r: r.get('modifiedTimestamp', 0))
-        main = row.get('sleepMainData') or row
+        # Choose the latest completed sleep by wake time. Modification time is
+        # only a tie-breaker; a late edit to an older night cannot replace the
+        # most recent completed record.
+        _sleep_out, _modified, row, main = max(completed, key=lambda item: (item[0], item[1]))
         return {'minutes': main.get('totalSleepTime', row['totalSleepTime']),
                 'bedtime': measured_at(main.get('sleepInTime')),
                 'wake_time': measured_at(main.get('sleepOutTime')),
@@ -87,7 +105,7 @@ def collect(date=None):
             if result['status'] != 'ok':
                 snapshot['errors'][metric] = {key: result[key] for key in ('status', 'error_code') if key in result}
                 continue
-            value = summarize(metric, result.get('records', []), date)
+            value = summarize(metric, result.get('records', []), date, dt.datetime.now(TZ))
             if value is not None:
                 snapshot['metrics'][metric] = value
     # Timestamp the completed fetch so scheduler freshness checks compare
@@ -108,8 +126,8 @@ def format_snapshot(snapshot):
     if 'heart_rate' in metrics:
         r = metrics['heart_rate']
         lines.append('最近一次心率：' + str(r['latest']) + ' 次/分；测量时间：' + str(r['measured_at']))
-        if 'resting' in r:
-            lines.append('静息心率：' + str(r['resting']) + ' 次/分')
+        if 'resting' in r and r.get('resting_measured_at'):
+            lines.append('最近一次静息心率记录：' + str(r['resting']) + ' 次/分；测量时间：' + str(r['resting_measured_at']))
     if 'blood_oxygen' in metrics:
         r = metrics['blood_oxygen']
         lines.append('最近一次血氧：' + str(r['latest']) + '%；测量时间：' + str(r['measured_at']))

@@ -21,6 +21,16 @@ _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
+_WELLNESS_CATEGORY_LABELS = {
+    "Excellent": "Excellent",
+    "Good": "Good",
+    "Moderate": "Moderate",
+    "Slow down": "Slow down",
+    "状态优秀": "Excellent",
+    "状态不错": "Good",
+    "状态正常": "Moderate",
+    "适当放松": "Slow down",
+}
 _WELLNESS_CATEGORIES = ("Excellent", "Good", "Moderate", "Slow down")
 _CYCLE_LEGEND = ("Period", "Predicted period", "Fertility window", "Ovulation")
 _WEEKDAY_ALIASES = {
@@ -129,6 +139,34 @@ def _rgb(observation: Mapping[str, Any]) -> tuple[float, float, float] | None:
     if any(part < 0 or part > 255 for part in result):
         return None
     return result
+
+
+def _classify_cycle_color(
+    color: tuple[float, float, float],
+    palette: Mapping[str, tuple[float, float, float]],
+    minimum_chroma: float,
+) -> str | None:
+    """Classify one calendar-cell sample against the visible legend colors."""
+    if max(color) - min(color) < minimum_chroma:
+        return "non_period" if min(color) >= 210 else None
+    distances = sorted((math.dist(color, swatch), label)
+                       for label, swatch in palette.items())
+    if distances[0][0] > 55:
+        return None
+    if distances[1][0] - distances[0][0] < 12:
+        best_axis = palette[distances[0][1]][0] - palette[distances[0][1]][2]
+        runner_up_axis = palette[distances[1][1]][0] - palette[distances[1][1]][2]
+        color_axis = color[0] - color[2]
+        hue_resolves_tie = (
+            abs(color_axis) >= 16
+            and abs(best_axis) >= 12
+            and abs(runner_up_axis) >= 12
+            and color_axis * best_axis > 0
+            and color_axis * runner_up_axis < 0
+        )
+        if not hue_resolves_tie:
+            return None
+    return distances[0][1]
 
 
 def _weekday_layout(
@@ -270,16 +308,112 @@ def parse_cycle_calendar(
                 raise ValueError("calendar day labels are duplicated")
             seen_days[day_number] = item
     expected_rows = list(range((first_column + days_in_month - 1) // 7 + 1))
-    located_rows = [next(iter({entry[1] for entry in group}))
-                    for group in sorted(row_groups, key=lambda values: values[0][0])
-                    if len({entry[1] for entry in group}) == 1]
-    if located_rows != expected_rows:
-        raise ValueError("calendar row order could not be verified")
-    if len(seen_days) < math.ceil(days_in_month * 0.9):
-        raise ValueError("calendar OCR did not cover enough dates to classify safely")
+    ordered_row_groups = [
+        group for group in sorted(row_groups, key=lambda values: values[0][0])
+        if len({entry[1] for entry in group}) == 1
+    ]
+    located_rows = [next(iter({entry[1] for entry in group})) for group in ordered_row_groups]
+    # OCR may omit individual date numerals; the local collector supplies
+    # calibrated cell samples only for the verified emulator viewport.
+    grid_items = [
+        item.get("calendar_grid_samples") for item in items
+        if isinstance(item.get("calendar_grid_samples"), Mapping)
+    ]
+    grid_valid = False
+    grid_available = len(grid_items) == 1
+    grid_weekdays_match = False
+    grid_rows_match = False
+    grid_sample_shape_match = False
+    grid_colors: list[list[Any]] = []
+    if grid_available:
+        grid = grid_items[0]
+        try:
+            grid_weekdays = [float(value) for value in grid.get("weekday_centers", [])]
+            grid_rows = [float(value) for value in grid.get("row_centers", [])]
+            grid_colors = grid.get("sample_rgb_candidates", [])
+            # OCR boxes for weekday names can be shifted by font width even
+            # when the date numerals and calibrated cell centers align. Use
+            # visible date numerals, whose weekday is fixed by the month
+            # heading, as the geometric anchors for the sampled grid.
+            weekday_anchor_errors: list[list[float]] = [[] for _ in range(7)]
+            row_anchor_errors: list[list[float]] = [[] for _ in expected_rows]
+            for day_number, item in seen_days.items():
+                bounds = _box(item)
+                if bounds is None:
+                    continue
+                x, y, width, height = bounds
+                offset = first_column + day_number - 1
+                row_index, column = offset // 7, offset % 7
+                if column >= len(grid_weekdays) or row_index >= len(grid_rows):
+                    continue
+                center_x, center_y = x + width / 2, y + height / 2
+                weekday_anchor_errors[column].append(abs(center_x - grid_weekdays[column]))
+                row_anchor_errors[row_index].append(abs(center_y - grid_rows[row_index]))
+            weekday_anchor_counts = [len(values) for values in weekday_anchor_errors]
+            row_anchor_counts = [len(values) for values in row_anchor_errors]
+            date_anchors_align_x = (
+                len(grid_weekdays) == 7
+                and all(count >= 2 for count in weekday_anchor_counts)
+                and all(max(errors) <= 0.02 for errors in weekday_anchor_errors)
+            )
+            date_anchors_align_y = (
+                len(grid_rows) == len(expected_rows)
+                and sum(count > 0 for count in row_anchor_counts) >= max(1, len(expected_rows) - 1)
+                and all(not errors or max(errors) <= 0.02 for errors in row_anchor_errors)
+            )
+            grid_weekdays_match = (
+                date_anchors_align_x
+            )
+            calibrated_rows = [472 / 1280, 592 / 1280, 712 / 1280, 832 / 1280, 952 / 1280]
+            grid_geometry_matches_screen = (
+                len(expected_rows) == len(calibrated_rows)
+                and len(grid_rows) == len(calibrated_rows)
+                and all(abs(left - right) <= 0.025 for left, right in zip(calibrated_rows, grid_rows))
+            )
+            grid_rows_match = (
+                grid_geometry_matches_screen and date_anchors_align_y
+            )
+            grid_sample_shape_match = (
+                len(grid_colors) == len(expected_rows)
+                and all(len(row) == 7 for row in grid_colors)
+                and all(
+                    isinstance(grid_colors[(first_column + day_number - 1) // 7]
+                               [(first_column + day_number - 1) % 7], list)
+                    and len(grid_colors[(first_column + day_number - 1) // 7]
+                             [(first_column + day_number - 1) % 7]) >= 5
+                    for day_number in range(1, days_in_month + 1)
+                )
+            )
+            grid_valid = (
+                grid_weekdays_match
+                and grid_rows_match
+                and grid_sample_shape_match
+                and len(seen_days) >= max(7, math.ceil(days_in_month * 0.5))
+            )
+        except (TypeError, ValueError):
+            grid_valid = False
+
+    if grid_valid:
+        verified_days: dict[int, Mapping[str, Any]] = {}
+        for day_number in range(1, days_in_month + 1):
+            offset = first_column + day_number - 1
+            row_index, column = offset // 7, offset % 7
+            candidates = grid_colors[row_index][column]
+            if isinstance(candidates, list) and len(candidates) >= 5:
+                verified_days[day_number] = {"sample_rgb_candidates": candidates}
+            elif day_number in seen_days:
+                verified_days[day_number] = seen_days[day_number]
+    else:
+        if located_rows != expected_rows:
+            raise ValueError("calendar row order could not be verified")
+        if len(seen_days) < math.ceil(days_in_month * 0.9):
+            raise ValueError("calendar OCR did not cover enough dates to classify safely")
+        verified_days = dict(seen_days)
 
     actual: list[str] = []
     predicted: list[str] = []
+    known_non_period: list[str] = []
+    classified: list[str] = []
     minimum_chroma = max(
         8.0,
         0.25 * min(
@@ -287,26 +421,52 @@ def parse_cycle_calendar(
             max(palette["Predicted period"]) - min(palette["Predicted period"]),
         ),
     )
-    for day_number, item in seen_days.items():
-        color = _rgb(item)
-        if color is None:
-            continue
-        if max(color) - min(color) < minimum_chroma:
-            continue
-        distances = sorted((math.dist(color, swatch), label)
-                           for label, swatch in palette.items())
-        if distances[0][0] > 55 or distances[1][0] - distances[0][0] < 12:
-            continue
+    for day_number, item in verified_days.items():
         day_text = date(year, month, day_number).isoformat()
-        if distances[0][1] == "Period":
+        classification = None
+        color_samples = item.get("sample_rgb_candidates")
+        if isinstance(color_samples, list):
+            votes: dict[str, int] = {}
+            for value in color_samples:
+                sample = _rgb({"sample_rgb": value}) if isinstance(value, Sequence) else None
+                label = _classify_cycle_color(sample, palette, minimum_chroma) if sample else None
+                if label:
+                    votes[label] = votes.get(label, 0) + 1
+            if votes:
+                ranked_votes = sorted(votes.items(), key=lambda entry: entry[1], reverse=True)
+                required_votes = len(color_samples) // 2 + 1
+                if (
+                    ranked_votes[0][1] >= required_votes
+                    and (len(ranked_votes) == 1 or ranked_votes[0][1] > ranked_votes[1][1])
+                ):
+                    classification = ranked_votes[0][0]
+        if classification is None:
+            color = _rgb(item)
+            classification = _classify_cycle_color(color, palette, minimum_chroma) if color else None
+        if classification is None:
+            continue
+        classified.append(day_text)
+        if classification == "Period":
             actual.append(day_text)
-        elif distances[0][1] == "Predicted period":
-            predicted.append(day_text)
+        else:
+            known_non_period.append(day_text)
+            if classification == "Predicted period":
+                predicted.append(day_text)
 
     metrics = {
         "period_dates": sorted(actual),
         "predicted_period_dates": sorted(predicted),
-        "calendar_coverage": f"{len(seen_days)}/{days_in_month}",
+        "known_non_period_dates": sorted(known_non_period),
+        "classified_dates": sorted(classified),
+        "classification_complete": len(classified) == days_in_month and len(verified_days) == days_in_month,
+        "calendar_coverage": f"{len(verified_days)}/{days_in_month}",
+        "calendar_label_coverage": f"{len(seen_days)}/{days_in_month}",
+        "calendar_grid_verified": grid_valid,
+        "calendar_grid_available": grid_available,
+        "calendar_grid_weekdays_match": grid_weekdays_match,
+        "calendar_grid_rows_match": grid_rows_match,
+        "calendar_grid_sample_shape_match": grid_sample_shape_match,
+        "classification_coverage": f"{len(classified)}/{days_in_month}",
         "legend_verified": True,
     }
     return _snapshot("cycle_calendar", observed_at, metrics,
@@ -610,14 +770,35 @@ def parse_wellness_home(
     selected = _selected_date(selected_date)
     _visible_day_matches(lines, selected)
     score_line = next((line for line in lines if re.fullmatch(r"\d{1,3}", line)), None)
-    category = next((name for name in _WELLNESS_CATEGORIES if name in lines), None)
+    value_labels = sorted(_WELLNESS_CATEGORY_LABELS, key=len, reverse=True)
+    value_line = next(
+        (line for line in lines if any(label.casefold() in line.casefold() for label in value_labels)),
+        "",
+    )
+    value_line_folded = value_line.casefold()
+    category_label = next(
+        (label for label in value_labels if label.casefold() in value_line_folded),
+        None,
+    )
+    category = next(
+        (_WELLNESS_CATEGORY_LABELS[label] for label in (category_label,) if label), None
+    )
+    paired_score = re.fullmatch(
+        r"\s*(\d{1,3})\s*(?:分\s*)?(?:" + "|".join(
+            re.escape(label) for label in value_labels
+        ) + r")\s*",
+        value_line,
+        re.IGNORECASE,
+    )
     time_match = next((re.fullmatch(r"(\d{1,2}):([0-5]\d)", line) for line in lines
                        if re.fullmatch(r"\d{1,2}:[0-5]\d", line)), None)
     metrics: dict[str, Any] = {
         "label": "Mind and Body",
         "kind": "home_point",
     }
-    if score_line:
+    if paired_score:
+        metrics["score"] = int(paired_score.group(1))
+    elif score_line:
         metrics["score"] = int(score_line)
     if category:
         metrics["category"] = category

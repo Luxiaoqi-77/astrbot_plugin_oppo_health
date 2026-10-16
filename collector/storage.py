@@ -13,10 +13,13 @@ def is_windows():
     return os.name == 'nt'
 
 def private_root():
+    """Return the plugin-owned private directory with owner-only access."""
     if is_windows():
         base = Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData/Local')))
         return base / 'AstrBot/oppo-health'
-    return Path.home() / '.local/share/astrbot-oppo-health'
+    root = Path.home() / '.local/share/astrbot-oppo-health'
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
 
 def _dpapi(payload, decrypt=False):
     """Use the logged-in Windows user, never machine-wide protection."""
