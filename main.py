@@ -133,7 +133,7 @@ from .local_request_policy import (
 from astrbot.core.utils.model_output_guard import is_consciousness_sync
 NAME = 'oppo_health'
 TZ = ZoneInfo('Asia/Shanghai')
-SLEEP_CARE_TARGET_UMO = 'qq_napcat_2258780898:FriendMessage:2870791457'
+SLEEP_CARE_TARGET_UMO = 'qq_napcat_100000002:FriendMessage:100000001'
 CARE_CONTEXT_TTL_SECONDS = 900
 MAX_PENDING_CARE_CONTEXTS = 32
 CARE_TOKEN_EXTRA = '_oppo_care_context_token'

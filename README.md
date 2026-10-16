@@ -130,3 +130,18 @@ node --check pages/care/care.js
 ## 来源与许可
 
 本项目采用 MIT 许可。`collector/oppo_sign.py` 的签名实现来自 [foxlesbiao/oppo-health-cloud-mcp](https://github.com/foxlesbiao/oppo-health-cloud-mcp)，参考提交 `d6a1040e4e35ef7f2bd8fe447a991db0fe0b4272`；保留其许可于 [collector/LICENSE.upstream](collector/LICENSE.upstream)。该文件顶部的签名常量是上游协议实现的一部分，不是某个使用者的账号凭证。
+
+---
+
+## 关于仓库中的占位符
+
+本仓库把**主人 QQ 号**与**机器人 QQ 号**替换成了占位符，避免公开真实账号：
+
+| 占位符 | 含义 |
+|---|---|
+| `100000001` | 使用者本人（owner）的 QQ 号 |
+| `100000002` | 机器人自己的 QQ 号 |
+
+**实际部署时**请把它们改成你自己的 QQ 号和机器人 QQ 号（通常出现在
+`OWNER_UMO` / `OWNER_SENDER_ID` / `DEFAULT_OWNER_UMO` / `authorized_umo`
+等待配置项，或插件的配置文件里）。
